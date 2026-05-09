@@ -1,7 +1,18 @@
+# football-pipeline-v4 dependencies
+# Versions pin to the same major as docker-compose services
+
+# Orchestration
 apache-airflow==2.9.1
-apache-airflow-providers-postgres==5.10.0
+apache-airflow-providers-postgres==5.10.2
+
+# Spark
+pyspark==3.5.1
+
+# Data
 pandas==2.2.2
 pyarrow==15.0.2
 psycopg2-binary==2.9.9
+
+# Testing
 pytest==8.2.0
 pytest-cov==5.0.0
