@@ -1,0 +1,29 @@
+apiVersion: 1
+
+providers:
+  - name: "football-pipeline"
+    orgId: 1
+    folder: "Football Pipeline"
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/provisioning/dashboards
+
+---
+# Dashboard: Football Pipeline — Main
+# Saved as football_pipeline_dashboard.json (inline summary)
+#
+# Panels:
+#   1. Pipeline Overview      — stage duration gauge per task
+#   2. Kafka Throughput       — kafka_messages_consumed_total rate
+#   3. Delta Lake Writes      — delta_rows_written_total counter
+#   4. Postgres Upserts       — postgres_upsert_total rate
+#   5. MLflow Model Versions  — registered model count
+#   6. SLA & Quality          — sla_breaches_total + quality_check_failures_total
+#
+# Alert Rules:
+#   - SLABreachAlert: FIRING when sla_breaches_total > 0 in last 1h
+#   - QualityCheckAlert: FIRING when quality_check_failures_total > 0 in last 1h
+#   - FreshnessAlert: FIRING when data_freshness_seconds > 90000 (25h)
+#   - RowCountDeltaAlert: FIRING when abs(row_count_delta) > 100

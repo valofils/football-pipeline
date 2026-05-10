@@ -1,0 +1,63 @@
+groups:
+  - name: football_pipeline_sla
+    interval: 60s
+    rules:
+      - alert: SLABreachAlert
+        expr: increase(sla_breaches_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "SLA breach detected"
+          description: "At least one pipeline stage has breached its SLA in the last hour. Stage: {{ $labels.stage }}, Severity: {{ $labels.severity }}"
+
+      - alert: SLACriticalBreachAlert
+        expr: increase(sla_breaches_total{severity="critical"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Critical SLA breach detected"
+          description: "A pipeline stage ran at 2x its SLA threshold. Stage: {{ $labels.stage }}"
+
+  - name: football_pipeline_quality
+    interval: 60s
+    rules:
+      - alert: QualityCheckFailureAlert
+        expr: increase(quality_check_failures_total[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data quality check failure"
+          description: "Quality check '{{ $labels.check_name }}' has failed in the last hour."
+
+      - alert: DataFreshnessAlert
+        expr: data_freshness_seconds > 90000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Data freshness threshold exceeded"
+          description: "Latest row is more than 25 hours old ({{ $value }}s)."
+
+      - alert: RowCountDeltaAlert
+        expr: abs(row_count_delta) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Row count mismatch between Kafka and Delta Lake"
+          description: "Delta between Kafka offsets and Delta Lake rows is {{ $value }}."
+
+  - name: football_pipeline_general
+    interval: 60s
+    rules:
+      - alert: PipelineStageSlow
+        expr: pipeline_stage_duration_seconds > 1800
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Pipeline stage running slowly"
+          description: "Stage {{ $labels.stage }} has been running for {{ $value }}s."
