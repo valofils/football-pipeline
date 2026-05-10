@@ -1,186 +1,192 @@
-# football-pipeline-v6 — Kafka + Airflow + Spark + dbt
+# football-pipeline-v7 — AWS (S3 + RDS) + Terraform
 
-Extends v5 by adding **Apache Kafka** before the Airflow pipeline.
-Instead of dropping CSVs into `data/raw/`, match events are produced to a
-Kafka topic and consumed into PostgreSQL in near-real-time.
+Lifts the pipeline into AWS. Adds one new skill layer on top of v6.
 
 ```
-CSV files  →  Producer  →  Kafka topic `match-events`
-                                   ↓
-                           Airflow DAG (weekly)
-                                   ↓
-               ┌───────────────────────────────────────┐
-               │  kafka_ingest  →  validate  →          │
-               │  load_postgres  →  dbt_run             │
-               └───────────────────────────────────────┘
-                                   ↓
-                         PostgreSQL  →  dbt models
-                         (matches_staging, matches, standings)
+v6 stack  +  S3 (Parquet lake)  +  RDS PostgreSQL  +  Terraform (IaC)
 ```
+
+Local Docker services unchanged: Kafka, Spark, Airflow, moto-server (local S3 mock).
 
 ---
 
-## What's new in v6
+## What changed vs v6
 
-| Component | Change |
-|---|---|
-| `kafka/producer/produce_matches.py` | Reads CSVs, publishes one JSON message per match to `match-events` |
-| `kafka/consumer/consume_matches.py` | Consumes topic, bulk-upserts into `matches_staging` |
-| `dags/football_pipeline.py` | `ingest` task replaced by `kafka_ingest` (calls consumer) |
-| `docker-compose.yaml` | Adds `zookeeper`, `kafka`, `kafka-ui` services |
-| `tests/test_dag.py` | 35 tests across 7 classes (adds `TestProducer`, `TestConsumer`, `TestConsumerUpsert`) |
-
----
-
-## Stack
-
-| Layer | Technology |
-|---|---|
-| Language | Python 3.12 |
-| Messaging | Apache Kafka 3.7 · confluent-kafka 2.4.0 |
-| DataFrames | PySpark 3.5.1 |
-| Serialisation | JSON (messages) · Parquet/Snappy (lake) |
-| Database | PostgreSQL 16 · psycopg2 · JDBC |
-| Modelling | dbt-core 1.8.3 · dbt-postgres |
-| Testing | pytest · pytest-cov · dbt test |
-| Orchestration | Apache Airflow 2.9.1 · LocalExecutor · PostgresHook |
-| Compute | Apache Spark 3.5.1 standalone cluster |
-| Infrastructure | Docker Compose |
+| Component | v6 | v7 |
+|---|---|---|
+| Parquet lake | `data/parquet/` (local volume) | `s3a://bucket/parquet/` (S3) |
+| PostgreSQL | `football-db` Docker container | AWS RDS db.t3.micro |
+| Infrastructure | docker-compose only | docker-compose + Terraform |
+| New fixture | — | `s3_bucket` (moto mock) |
+| New test class | 7 classes / 35 tests | 8 classes / 40 tests |
+| New helpers | — | `s3a_path()` in spark_utils |
+| New JARs | `postgresql.jar` | + `hadoop-aws.jar` + `aws-java-sdk-bundle.jar` |
 
 ---
 
-## Quickstart
+## Prerequisites
 
-### 1. Start the stack
+- Docker + Docker Compose
+- Terraform ≥ 1.7 (`brew install terraform` / `apt install terraform`)
+- AWS CLI configured (`aws configure` or env vars)
+- Python 3.12 virtual environment
 
-```bash
-docker compose up -d
-```
+---
 
-Services and ports:
+## Quick start
 
-| Service | URL |
-|---|---|
-| Airflow UI | http://localhost:8081 (admin / admin) |
-| Kafka UI | http://localhost:8080 |
-| Spark Master UI | http://localhost:8082 |
-| Football DB | localhost:5433 |
-
-### 2. Download the PostgreSQL JDBC JAR (one-time)
+### 1 — Download JARs
 
 ```bash
-mkdir -p spark/jars
-curl -L -o spark/jars/postgresql.jar \
-  https://jdbc.postgresql.org/download/postgresql-42.7.3.jar
+chmod +x scripts/get_jars.sh
+./scripts/get_jars.sh
 ```
 
-### 3. Produce match events
-
-Run the producer against your CSV files (from outside Docker, using the
-EXTERNAL Kafka listener on port 9093):
+### 2 — Provision AWS infrastructure
 
 ```bash
-KAFKA_BOOTSTRAP_SERVERS=localhost:9093 \
-  python kafka/producer/produce_matches.py --data-dir data/raw/
+cd terraform
+cp terraform.tfvars.example terraform.tfvars
+# Edit terraform.tfvars: set bucket_name, local_cidr
+export TF_VAR_db_password="your-secure-password"
+
+terraform init
+terraform plan
+terraform apply          # ~5 min for RDS
 ```
 
-Or for a single season:
+Note the outputs:
+
+```
+s3_bucket_name = "football-pipeline-parquet-lake-xyz"
+rds_host       = "football-pipeline-db-dev.xxxx.eu-west-1.rds.amazonaws.com"
+rds_port       = 5432
+```
+
+### 3 — Bootstrap the RDS schema
 
 ```bash
-KAFKA_BOOTSTRAP_SERVERS=localhost:9093 \
-  python kafka/producer/produce_matches.py --data-dir data/raw/ --season 2023-24
+export PGPASSWORD="your-secure-password"
+psql -h <rds_host> -U football_user -d football -f scripts/bootstrap_rds.sql
 ```
 
-### 4. Trigger the DAG
+### 4 — Configure environment
 
-In the Airflow UI, enable and trigger `football_pipeline` manually, or wait
-for the `@weekly` schedule.
+Create a `.env` file in the project root (git-ignored):
 
-The `kafka_ingest` task will consume all pending messages from `match-events`
-and upsert them into `matches_staging`.
+```bash
+# .env
+FOOTBALL_DB_HOST=<rds_host from terraform output>
+FOOTBALL_DB_PORT=5432
+FOOTBALL_DB_NAME=football
+FOOTBALL_DB_USER=football_user
+FOOTBALL_DB_PASSWORD=your-secure-password
 
-### 5. Run tests
+AWS_ACCESS_KEY_ID=<your key>
+AWS_SECRET_ACCESS_KEY=<your secret>
+AWS_DEFAULT_REGION=eu-west-1
+S3_BUCKET_NAME=<bucket_name from terraform output>
+```
+
+### 5 — Start local services
+
+```bash
+docker compose --env-file .env up -d
+```
+
+### 6 — Publish test data to Kafka
+
+```bash
+python kafka/producer/produce_matches.py data/raw/matches.csv
+```
+
+### 7 — Trigger the DAG
+
+Open Airflow at http://localhost:8080 (admin / admin) and trigger `football_pipeline`.
+
+---
+
+## Running tests
+
+Tests use moto to mock S3 — no real AWS calls needed:
 
 ```bash
 pip install -r requirements.txt
-pytest tests/ -v --cov=. --cov-report=term-missing
+pytest tests/ -v --cov=dags --cov=kafka --cov-report=term-missing
 ```
 
-DB-dependent tests (`TestConsumerUpsert`) are skipped automatically if
-`football-db` is not reachable on `localhost:5433`.
+Expected: **40 tests, 100% pass**.
 
 ---
 
-## Key Kafka concepts introduced in v6
+## Terraform teardown
 
-### Topic: `match-events`
-
-- **Partitions**: 3 (parallel consumption; messages keyed by `season:match_id`
-  so all matches for a season land in the same partition)
-- **Retention**: 7 days (`retention.ms`)
-- **Cleanup policy**: `delete` (segments expire; no compaction)
-
-### Producer config
-
-```python
-"acks": "all"          # Wait for leader + all ISRs to ack
-"retries": 5           # Retry transient errors
-"linger.ms": 10        # Batch small messages for throughput
+```bash
+cd terraform
+terraform destroy
 ```
 
-### Consumer config
+This destroys the RDS instance and S3 bucket. The bucket must be empty first:
 
-```python
-"auto.offset.reset": "earliest"   # Start from beginning if no committed offset
-"enable.auto.commit": False        # Manual commit — only after successful DB write
+```bash
+aws s3 rm s3://<bucket_name> --recursive
+terraform destroy
 ```
 
-### Offset management
+---
 
-The consumer:
-1. Snapshots the **high-water mark** (end offset) for each partition at startup
-2. Reads until all partitions reach their high-water mark (catches up to
-   messages that existed when the job started)
-3. **Commits offsets manually** after each successful DB upsert batch
-4. On the next DAG run, consumption resumes from the last committed offset
-   (`earliest` fallback only applies to a brand-new consumer group)
+## Key mental models added in v7
 
-### Airflow integration
+### S3 as a data lake
+- S3 stores objects under a flat key namespace; `/` in keys is just a naming convention
+- Spark's `s3a://` scheme (via `hadoop-aws`) treats S3 like a filesystem
+- Partitioned Parquet writes create `season=2023-24/` prefixes — Spark pushes filters down to skip irrelevant prefixes at read time
 
-`kafka_ingest` is a plain `@task`-decorated Python callable — no Kafka-specific
-Airflow operator required.  The consumer runs as a **finite batch job**
-(not a long-running daemon): it catches up to the high-water mark and exits.
+### Terraform lifecycle
+- `terraform init` → download provider plugins
+- `terraform plan` → diff desired vs actual state (read-only)
+- `terraform apply` → converge actual to desired; updates `terraform.tfstate`
+- State file is the source of truth — never edit manually; commit to remote backend (S3 + DynamoDB lock) in production
+
+### IAM least-privilege
+- The pipeline role gets `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` only on the specific bucket ARN
+- No `s3:*` wildcard — avoids accidental cross-bucket access
+
+### RDS vs Docker Postgres
+- Same PostgreSQL 16 engine; wire protocol identical — psycopg2 and JDBC work unchanged
+- RDS handles: automated backups, Multi-AZ failover, patching
+- `publicly_accessible = true` + `local_cidr` variable lets you connect directly during dev; set `false` in production and route via a bastion or VPN
+
+### moto for S3 unit tests
+- `@mock_aws` intercepts all boto3 / botocore calls — no real HTTP to AWS
+- `spark.hadoop.fs.s3a.endpoint` pointed at the moto server for Spark S3A calls
+- Pattern: session-scoped bucket fixture → test writes Parquet → test reads it back
 
 ---
 
 ## Project structure
 
 ```
-football-pipeline-v6/
-├── kafka/
-│   ├── producer/
-│   │   └── produce_matches.py
-│   └── consumer/
-│       └── consume_matches.py
+football-pipeline-v7/
+├── terraform/
+│   ├── main.tf                  # S3 bucket + RDS + IAM + VPC
+│   ├── variables.tf
+│   ├── outputs.tf
+│   └── terraform.tfvars.example
 ├── dags/
-│   ├── football_pipeline.py
-│   └── spark_utils.py
-├── dbt/
-│   ├── models/
-│   │   ├── staging/
-│   │   │   ├── sources.yml
-│   │   │   └── stg_matches.sql
-│   │   └── marts/
-│   │       ├── standings.sql
-│   │       └── schema.yml
-│   ├── tests/
-│   │   └── assert_positive_goals.sql
-│   └── profiles.yml
+│   ├── football_pipeline.py     # DAG: kafka_ingest >> validate >> load_postgres >> dbt_run
+│   └── spark_utils.py           # SparkSession factory + s3a_path() helper
+├── kafka/
+│   ├── producer/produce_matches.py
+│   └── consumer/consume_matches.py
+├── dbt/                         # unchanged from v5/v6
 ├── tests/
-│   ├── conftest.py
-│   └── test_dag.py
-├── spark/
-│   └── jars/          ← place postgresql.jar here
-├── docker-compose.yaml
+│   ├── conftest.py              # + s3_bucket (moto) + aws_credentials fixtures
+│   └── test_dag.py              # 40 tests, 8 classes
+├── scripts/
+│   ├── get_jars.sh              # downloads postgresql + hadoop-aws + aws-java-sdk-bundle
+│   └── bootstrap_rds.sql        # DDL for RDS
+├── spark/jars/                  # JAR files (git-ignored)
+├── docker-compose.yaml          # + moto-server; football-db removed
 └── requirements.txt
 ```

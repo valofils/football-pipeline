@@ -1,0 +1,14 @@
+# Copy to terraform.tfvars and fill in your values.
+# Never commit terraform.tfvars — it is git-ignored.
+
+aws_region  = "eu-west-1"
+environment = "dev"
+bucket_name = "football-pipeline-parquet-lake-YOUR_UNIQUE_SUFFIX"
+
+db_name     = "football"
+db_username = "football_user"
+# db_password supplied via: export TF_VAR_db_password="yourpassword"
+
+# Your current public IP + /32 so you can connect to RDS directly.
+# Find it with: curl -s https://checkip.amazonaws.com
+local_cidr = "0.0.0.0/32"

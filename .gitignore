@@ -1,23 +1,26 @@
-# Python
-__pycache__/
 *.pyc
+__pycache__/
+.env
 .venv/
-*.egg-info/
+venv/
+
+# Terraform
+terraform/.terraform/
+terraform/terraform.tfstate
+terraform/terraform.tfstate.backup
+terraform/terraform.tfvars
+terraform/.terraform.lock.hcl
+
+# Spark JARs (downloaded locally, not committed)
+spark/jars/*.jar
 
 # Airflow
 logs/
 airflow.db
 
-# Data (generated)
-data/parquet/
-
-# dbt artifacts
+# dbt
 dbt/target/
 dbt/dbt_packages/
-dbt/.user.yml
 
-# Spark JARs (download manually per README)
-spark/jars/*.jar
-
-# Env
-.env
+# Data
+data/
