@@ -1,56 +1,43 @@
-# docker-compose.yaml — football-pipeline-v8
-#
-# Changes from v7
-# ---------------
-# * SPARK_JARS: delta-spark and delta-storage JARs appended.
-# * spark-master / spark-worker: DELTA_SPARK_EXTENSIONS env var added so the
-#   standalone cluster workers also pick up Delta extensions.
-# * Everything else (Kafka, Zookeeper, Airflow, moto-server) unchanged.
+version: "3.9"
 
 x-airflow-common: &airflow-common
   image: apache/airflow:2.9.1-python3.12
   environment: &airflow-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
-    # DB
-    FOOTBALL_DB_HOST: ${FOOTBALL_DB_HOST}          # RDS endpoint (set in .env)
-    FOOTBALL_DB_PORT: "5432"
+    # Postgres / RDS
+    FOOTBALL_DB_HOST: ${FOOTBALL_DB_HOST}
+    FOOTBALL_DB_PORT: ${FOOTBALL_DB_PORT:-5432}
     FOOTBALL_DB_NAME: football
     FOOTBALL_DB_USER: ${FOOTBALL_DB_USER}
     FOOTBALL_DB_PASSWORD: ${FOOTBALL_DB_PASSWORD}
-    # S3
-    S3_BUCKET_NAME: ${S3_BUCKET_NAME}
+    # AWS / S3
     AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
     AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
     AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
-    # Point Spark S3A at moto-server when MOTO=true (local dev / CI)
-    AWS_S3_ENDPOINT: ${AWS_S3_ENDPOINT:-https://s3.amazonaws.com}
+    S3_BUCKET_NAME: ${S3_BUCKET_NAME}
     # Kafka
     KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-    KAFKA_TOPIC: football-matches
-    # Spark master
+    KAFKA_TOPIC: matches
+    # Spark
     SPARK_MASTER_URL: spark://spark-master:7077
-    # v8: Delta + existing JARs
-    SPARK_JARS: >-
-      /opt/spark/jars/postgresql-42.7.3.jar,
-      /opt/spark/jars/hadoop-aws-3.3.4.jar,
-      /opt/spark/jars/aws-java-sdk-bundle-1.12.262.jar,
-      /opt/spark/jars/delta-spark_2.12-3.2.0.jar,
-      /opt/spark/jars/delta-storage-3.2.0.jar
+    SPARK_JARS: /opt/spark/jars/postgresql.jar,/opt/spark/jars/hadoop-aws.jar,/opt/spark/jars/aws-java-sdk-bundle.jar,/opt/spark/jars/delta-spark_2.12-3.2.0.jar,/opt/spark/jars/delta-storage-3.2.0.jar
+    # Great Expectations — no extra services; uses S3 stores declared in great_expectations.yml
+    GX_ROOT: /opt/airflow/gx
   volumes:
     - ./dags:/opt/airflow/dags
+    - ./gx:/opt/airflow/gx
     - ./dbt:/opt/airflow/dbt
-    - ./logs:/opt/airflow/logs
     - ./spark/jars:/opt/spark/jars
+    - ./logs:/opt/airflow/logs
   depends_on:
     airflow-db:
       condition: service_healthy
 
 services:
-
-  # ── Airflow metadata DB ────────────────────────────────────────────────────
   airflow-db:
     image: postgres:16
     environment:
@@ -58,42 +45,28 @@ services:
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 5s
-      retries: 10
-    volumes:
-      - airflow_db_data:/var/lib/postgresql/data
+      retries: 5
 
-  # ── Airflow ────────────────────────────────────────────────────────────────
   airflow-webserver:
     <<: *airflow-common
     command: webserver
     ports:
       - "8080:8080"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      retries: 5
 
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
 
-  airflow-init:
-    <<: *airflow-common
-    command: db migrate
-    restart: "no"
-
-  # ── Spark ──────────────────────────────────────────────────────────────────
   spark-master:
     image: bitnami/spark:3.5.1
     environment:
       SPARK_MODE: master
-      # v8: tell workers to load Delta extensions by default
       SPARK_EXTRA_CLASSPATH: /opt/spark/jars/delta-spark_2.12-3.2.0.jar:/opt/spark/jars/delta-storage-3.2.0.jar
     ports:
-      - "7077:7077"
       - "8081:8080"
+      - "7077:7077"
     volumes:
       - ./spark/jars:/opt/spark/jars
 
@@ -105,21 +78,15 @@ services:
       SPARK_EXTRA_CLASSPATH: /opt/spark/jars/delta-spark_2.12-3.2.0.jar:/opt/spark/jars/delta-storage-3.2.0.jar
     volumes:
       - ./spark/jars:/opt/spark/jars
-    depends_on:
-      - spark-master
 
-  # ── Kafka ──────────────────────────────────────────────────────────────────
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
-    volumes:
-      - zookeeper_data:/var/lib/zookeeper/data
 
   kafka:
     image: confluentinc/cp-kafka:7.6.0
-    depends_on:
-      - zookeeper
+    depends_on: [zookeeper]
     ports:
       - "9092:9092"
     environment:
@@ -127,8 +94,6 @@ services:
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-    volumes:
-      - kafka_data:/var/lib/kafka/data
 
   kafka-ui:
     image: provectuslabs/kafka-ui:latest
@@ -137,18 +102,11 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-    depends_on:
-      - kafka
+    depends_on: [kafka]
 
-  # ── moto S3 mock (local dev / CI only) ────────────────────────────────────
   moto-server:
     image: motoserver/moto:latest
     ports:
       - "5555:5000"
     environment:
-      MOTO_SERVICE: s3
-
-volumes:
-  airflow_db_data:
-  zookeeper_data:
-  kafka_data:
+      MOTO_S3_CUSTOM_ENDPOINTS: "http://moto-server:5000"

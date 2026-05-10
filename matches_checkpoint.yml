@@ -1,0 +1,22 @@
+{
+  "name": "matches_checkpoint",
+  "config_version": 1.0,
+  "class_name": "SimpleCheckpoint",
+  "expectation_suite_name": "matches_suite",
+  "run_name_template": "%Y%m%dT%H%M%S-matches-validation",
+  "action_list": [
+    {
+      "name": "store_validation_result",
+      "action": {
+        "class_name": "StoreValidationResultAction"
+      }
+    },
+    {
+      "name": "update_data_docs",
+      "action": {
+        "class_name": "UpdateDataDocsAction",
+        "site_names": ["s3_site"]
+      }
+    }
+  ]
+}
