@@ -1,166 +1,150 @@
 """
-dags/football_pipeline.py
---------------------------
-v11 — Spark Structured Streaming replaces the batch Kafka consumer.
+dags/football_pipeline.py  —  v13
+Adds OpenLineage lineage emission around every pipeline task.
+All six stages now emit START / COMPLETE / FAIL RunEvents to Marquez.
 
-Task chain:
+Pipeline:
     streaming_ingest >> validate >> load_postgres >> [dbt_run, ml_train] >> predict
-
-streaming_ingest:
-    Submits streaming/stream_ingest.py with --once so Airflow can treat it
-    as a finite task: the job drains all available Kafka offsets then exits.
-    Uses BashOperator + spark-submit (compatible with local Compose cluster).
-    In production, swap for SparkSubmitOperator or KubernetesPodOperator.
 """
 
 from __future__ import annotations
 
-import logging
 import os
+import subprocess
+import uuid
 from datetime import datetime, timedelta
 
 from airflow import DAG
-from airflow.operators.bash import BashOperator
 from airflow.operators.python import PythonOperator
+from airflow.operators.bash import BashOperator
 
-# ---------------------------------------------------------------------------
-# Shared helpers (carried forward from v10)
-# ---------------------------------------------------------------------------
-from gx_utils import DataQualityError, validate_dataframe
-from ml.predict import predict as ml_predict_fn
-from ml.train import train as ml_train_fn
-
-logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Paths / config
-# ---------------------------------------------------------------------------
-DELTA_PATH = os.getenv("DELTA_PATH", "s3a://football-data/delta/matches")
-PREDICTIONS_PATH = os.getenv(
-    "PREDICTIONS_DELTA_PATH", "s3a://football-data/delta/predictions"
+# lineage emitters (module mounted into the Airflow container)
+from lineage.emitters import (
+    emit_streaming_ingest,
+    emit_validation,
+    emit_load_postgres,
+    emit_dbt_run,
+    emit_ml_train,
+    emit_predict,
 )
-DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/opt/airflow/dbt")
-SPARK_SUBMIT = os.getenv("SPARK_SUBMIT_BIN", "spark-submit")
-STREAM_SCRIPT = os.getenv(
+
+# ---------------------------------------------------------------------------
+# Default args
+# ---------------------------------------------------------------------------
+
+default_args = {
+    "owner": "football-pipeline",
+    "retries": 2,
+    "retry_delay": timedelta(minutes=5),
+    "email_on_failure": False,
+}
+
+SPARK_SUBMIT_OPTIONS = os.getenv(
+    "SPARK_SUBMIT_OPTIONS",
+    "--packages io.delta:delta-spark_2.12:3.2.0,"
+    "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1",
+)
+STREAM_SCRIPT_PATH = os.getenv(
     "STREAM_SCRIPT_PATH", "/opt/airflow/streaming/stream_ingest.py"
 )
 
-# Spark submit options injected from docker-compose via environment variable
-# e.g. --packages io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
-SPARK_SUBMIT_OPTS = os.getenv("SPARK_SUBMIT_OPTIONS", "")
-
-default_args = {
-    "owner": "airflow",
-    "depends_on_past": False,
-    "email_on_failure": False,
-    "retries": 1,
-    "retry_delay": timedelta(minutes=5),
-}
 
 # ---------------------------------------------------------------------------
-# Task callables (Python-based tasks unchanged from v10)
+# Task callables
 # ---------------------------------------------------------------------------
 
-
-def _get_spark(app_name: str = "football-airflow"):
-    from delta import configure_spark_with_delta_pip
-    from pyspark.sql import SparkSession
-
-    builder = (
-        SparkSession.builder.appName(app_name)
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config(
-            "spark.sql.catalog.spark_catalog",
-            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+def _run_streaming_ingest(**ctx):
+    run_id = str(uuid.uuid4())
+    with emit_streaming_ingest(run_id=run_id):
+        cmd = (
+            f"spark-submit {SPARK_SUBMIT_OPTIONS} {STREAM_SCRIPT_PATH} --once"
         )
-    )
-    return configure_spark_with_delta_pip(builder).getOrCreate()
+        result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
+        print(result.stdout)
 
 
-def validate(**_) -> None:
-    spark = _get_spark("football-validate")
-    df = spark.read.format("delta").load(DELTA_PATH)
-    validate_dataframe(df)
-    logger.info("Validation passed.")
+def _run_validate(**ctx):
+    run_id = str(uuid.uuid4())
+    with emit_validation(run_id=run_id):
+        from dags.gx_utils import run_checkpoint  # noqa: PLC0415
+        run_checkpoint()
 
 
-def load_postgres(**_) -> None:
-    import os
-
-    spark = _get_spark("football-load-pg")
-    df = spark.read.format("delta").load(DELTA_PATH)
-    pandas_df = df.toPandas()
-
-    import sqlalchemy
-
-    pg_url = os.getenv(
-        "POSTGRES_CONN",
-        "postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow",
-    )
-    engine = sqlalchemy.create_engine(pg_url)
-    pandas_df.to_sql("matches", engine, if_exists="replace", index=False)
-    logger.info("Loaded %d rows to postgres.matches", len(pandas_df))
+def _run_load_postgres(**ctx):
+    run_id = str(uuid.uuid4())
+    with emit_load_postgres(run_id=run_id):
+        from dags.postgres_loader import load  # noqa: PLC0415
+        load()
 
 
-def dbt_run(**_) -> None:
-    import subprocess
-
-    result = subprocess.run(
-        ["dbt", "run", "--project-dir", DBT_PROJECT_DIR, "--profiles-dir", DBT_PROJECT_DIR],
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"dbt run failed:\n{result.stderr}")
-    logger.info(result.stdout)
-
-
-def ml_train(**context) -> None:
-    run_id = ml_train_fn(run_name=f"airflow_{context['ds_nodash']}")
-    context["ti"].xcom_push(key="mlflow_run_id", value=run_id)
-    logger.info("MLflow run_id: %s", run_id)
+def _run_dbt(**ctx):
+    run_id = str(uuid.uuid4())
+    with emit_dbt_run(run_id=run_id):
+        result = subprocess.run(
+            "dbt run --profiles-dir /opt/airflow/dbt_project --project-dir /opt/airflow/dbt_project",
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        print(result.stdout)
 
 
-def predict(**_) -> None:
-    spark = _get_spark("football-predict")
-    written = ml_predict_fn(spark=spark)
-    logger.info("predict task wrote %d new predictions", written)
+def _run_ml_train(**ctx):
+    run_id = str(uuid.uuid4())
+    with emit_ml_train(run_id=run_id):
+        from ml.train import train  # noqa: PLC0415
+        train()
 
 
-# ---------------------------------------------------------------------------
-# Spark-submit command for the streaming task
-# ---------------------------------------------------------------------------
-STREAM_CMD = (
-    f"{SPARK_SUBMIT} "
-    f"${{SPARK_SUBMIT_OPTIONS}} "   # noqa: E501 — Airflow expands env vars in BashOperator
-    f"{STREAM_SCRIPT} --once"
-)
+def _run_predict(**ctx):
+    run_id = str(uuid.uuid4())
+    with emit_predict(run_id=run_id):
+        from ml.predict import predict  # noqa: PLC0415
+        predict()
+
 
 # ---------------------------------------------------------------------------
 # DAG
 # ---------------------------------------------------------------------------
+
 with DAG(
     dag_id="football_pipeline",
     default_args=default_args,
-    schedule_interval="@daily",
     start_date=datetime(2024, 1, 1),
+    schedule_interval="@daily",
     catchup=False,
-    tags=["football", "streaming", "mlops"],
+    tags=["football", "streaming", "mlops", "lineage"],
 ) as dag:
 
-    # v11: streaming_ingest replaces the old kafka_ingest PythonOperator.
-    # --once makes the job finite so Airflow can mark it success/failed.
-    t_stream = BashOperator(
+    streaming_ingest = PythonOperator(
         task_id="streaming_ingest",
-        bash_command=STREAM_CMD,
-        env={**os.environ, "SPARK_SUBMIT_OPTIONS": SPARK_SUBMIT_OPTS},
+        python_callable=_run_streaming_ingest,
     )
 
-    t_validate = PythonOperator(task_id="validate", python_callable=validate)
-    t_load = PythonOperator(task_id="load_postgres", python_callable=load_postgres)
-    t_dbt = PythonOperator(task_id="dbt_run", python_callable=dbt_run)
-    t_train = PythonOperator(task_id="ml_train", python_callable=ml_train)
-    t_predict = PythonOperator(task_id="predict", python_callable=predict)
+    validate = PythonOperator(
+        task_id="validate",
+        python_callable=_run_validate,
+    )
 
-    t_stream >> t_validate >> t_load >> [t_dbt, t_train]
-    t_train >> t_predict
+    load_postgres = PythonOperator(
+        task_id="load_postgres",
+        python_callable=_run_load_postgres,
+    )
+
+    dbt_run = PythonOperator(
+        task_id="dbt_run",
+        python_callable=_run_dbt,
+    )
+
+    ml_train = PythonOperator(
+        task_id="ml_train",
+        python_callable=_run_ml_train,
+    )
+
+    predict = PythonOperator(
+        task_id="predict",
+        python_callable=_run_predict,
+    )
+
+    streaming_ingest >> validate >> load_postgres >> [dbt_run, ml_train] >> predict

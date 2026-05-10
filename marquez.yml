@@ -1,0 +1,29 @@
+# lineage/marquez.yml
+# Marquez server configuration for football-pipeline.
+# Mounted read-only into the marquez container at /opt/marquez/marquez.yml.
+
+server:
+  applicationConnectors:
+    - type: http
+      port: 5000
+  adminConnectors:
+    - type: http
+      port: 5001
+
+db:
+  driverClass: org.postgresql.Driver
+  url: jdbc:postgresql://marquez-db:5432/marquez
+  user: marquez
+  password: marquez
+
+migrateOnStartup: true
+
+# Retain all lineage events (no TTL); tune for prod as needed.
+tagsOnDelete: false
+
+logging:
+  level: INFO
+  appenders:
+    - type: console
+      threshold: INFO
+      target: stdout

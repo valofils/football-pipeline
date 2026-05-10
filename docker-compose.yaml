@@ -1,238 +1,253 @@
 version: "3.9"
 
-# ────────────────────────────────────────────────────────────────────────────
-# Shared environment references
-# ────────────────────────────────────────────────────────────────────────────
-x-airflow-env: &airflow-env
-  AIRFLOW__CORE__EXECUTOR: LocalExecutor
-  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-  AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
-  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-  # v11: streaming
-  SPARK_SUBMIT_OPTIONS: "--packages io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
-  STREAM_SCRIPT_PATH: /opt/airflow/streaming/stream_ingest.py
-  STREAMING_CHECKPOINT_PATH: s3a://${S3_BUCKET}/checkpoints/matches
-  # AWS
-  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-  AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
-  S3_BUCKET: ${S3_BUCKET}
-  # Postgres RDS
-  POSTGRES_HOST: ${POSTGRES_HOST}
-  POSTGRES_DB: ${POSTGRES_DB}
-  POSTGRES_USER: ${POSTGRES_USER}
-  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-  # Kafka
-  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-  # MLflow
-  MLFLOW_TRACKING_URI: http://mlflow:5000
-  # v12: Prometheus push (optional – tasks can push run metrics)
-  PROMETHEUS_PUSHGATEWAY_URL: http://pushgateway:9091
+# ============================================================
+# football-pipeline  v13 — Governance / Lineage
+# Adds: marquez-api, marquez-web
+# Keeps: all v12 services (prometheus, grafana, exporters, airflow, kafka,
+#        spark, mlflow, postgres, moto-server)
+# ============================================================
 
-x-airflow-volumes: &airflow-volumes
-  - ./dags:/opt/airflow/dags
-  - ./plugins:/opt/airflow/plugins
-  - ./streaming:/opt/airflow/streaming   # v11
-  - ./data:/opt/airflow/data
-  - ./models:/opt/airflow/models
-  - ./expectations:/opt/airflow/expectations
-
-networks:
-  pipeline:
-    driver: bridge
-
-volumes:
-  postgres-data:
-  kafka-data:
-  spark-data:
-  mlflow-data:
-  delta-data:
-  prometheus-data:   # v12
-  grafana-data:      # v12
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.1-python3.12
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:-zW3oSiT4sZ2kQ8v6U1nP9rM5eD7yH0fJ3bX2cA4lV6g=}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY:-football-pipeline-secret}
+    # --- pipeline env ---
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    KAFKA_TOPIC: football_matches
+    DELTA_PATH: s3a://football-data/delta/matches
+    STREAMING_CHECKPOINT_PATH: s3a://football-data/checkpoints/matches
+    STREAM_SCRIPT_PATH: /opt/airflow/streaming/stream_ingest.py
+    SPARK_SUBMIT_OPTIONS: >-
+      --packages io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    AWS_DEFAULT_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+    S3_ENDPOINT_URL: http://moto-server:5000
+    # --- v13 lineage ---
+    MARQUEZ_URL: http://marquez:5000
+    OPENLINEAGE_NAMESPACE: football_pipeline
+    OPENLINEAGE_URL: http://marquez:5000
+    # --- v12 observability ---
+    PROMETHEUS_PUSHGATEWAY: http://pushgateway:9091
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./streaming:/opt/airflow/streaming
+    - ./ml:/opt/airflow/ml
+    - ./lineage:/opt/airflow/lineage
+    - ./logs:/opt/airflow/logs
+  depends_on:
+    airflow-db:
+      condition: service_healthy
 
 services:
-  # ── PostgreSQL ───────────────────────────────────────────────────────────────
-  postgres:
+
+  # ------------------------------------------------------------------
+  # Infrastructure
+  # ------------------------------------------------------------------
+
+  airflow-db:
     image: postgres:16
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-    networks: [pipeline]
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
-      interval: 10s
-      retries: 5
+      interval: 5s
+      retries: 10
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+      - ./scripts/init_mlflow_db.sql:/docker-entrypoint-initdb.d/init_mlflow_db.sql
 
-  # ── Airflow ──────────────────────────────────────────────────────────────────
-  airflow-init:
-    image: apache/airflow:2.9.1-python3.12
-    depends_on: [postgres]
-    environment: *airflow-env
-    entrypoint: >
-      bash -c "airflow db migrate && airflow users create
-        --username admin --password admin --firstname Admin
-        --lastname User --role Admin --email admin@example.com"
-    networks: [pipeline]
-
-  airflow-webserver:
-    image: apache/airflow:2.9.1-python3.12
-    depends_on: [airflow-init]
-    environment: *airflow-env
-    volumes: *airflow-volumes
-    ports: ["8080:8080"]
-    command: webserver
-    networks: [pipeline]
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
-      retries: 5
-
-  airflow-scheduler:
-    image: apache/airflow:2.9.1-python3.12
-    depends_on: [airflow-init]
-    environment: *airflow-env
-    volumes: *airflow-volumes
-    command: scheduler
-    networks: [pipeline]
-
-  # ── Kafka ────────────────────────────────────────────────────────────────────
   zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.0
+    image: confluentinc/cp-zookeeper:7.6.1
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
-    networks: [pipeline]
+    volumes:
+      - zookeeper-data:/var/lib/zookeeper/data
 
   kafka:
-    image: confluentinc/cp-kafka:7.6.0
+    image: confluentinc/cp-kafka:7.6.1
     depends_on: [zookeeper]
+    ports:
+      - "9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-    volumes: [kafka-data:/var/lib/kafka/data]
-    networks: [pipeline]
-    ports: ["9092:9092"]
-
-  # v12: Kafka exporter for Prometheus
-  kafka-exporter:
-    image: danielqsj/kafka-exporter:latest
-    command:
-      - --kafka.server=kafka:9092
-      - --web.listen-address=:9308
-    depends_on: [kafka]
-    networks: [pipeline]
-    ports: ["9308:9308"]
-
-  # ── Spark ────────────────────────────────────────────────────────────────────
-  spark-master:
-    image: bitnami/spark:3.5.1
-    environment:
-      SPARK_MODE: master
-      SPARK_METRICS_ENABLED: "true"   # exposes /metrics/prometheus on 4040
     volumes:
-      - spark-data:/opt/bitnami/spark/data
-      - ./streaming:/opt/airflow/streaming
+      - kafka-data:/var/lib/kafka/data
+
+  moto-server:
+    image: motoserver/moto:5.0.7
     ports:
-      - "8090:8080"   # Spark UI
-      - "4040:4040"   # Spark metrics / streaming UI
-    networks: [pipeline]
-
-  spark-worker:
-    image: bitnami/spark:3.5.1
+      - "5001:5000"
     environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
-    depends_on: [spark-master]
-    networks: [pipeline]
+      MOTO_S3_DEFAULT_KEY_BUFFER_FILE_SIZE: "16384"
 
-  # ── MLflow ───────────────────────────────────────────────────────────────────
+  # ------------------------------------------------------------------
+  # Airflow
+  # ------------------------------------------------------------------
+
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "
+        airflow db migrate &&
+        airflow users create --username admin --password admin
+          --firstname Admin --lastname User --role Admin
+          --email admin@example.com || true
+      "
+    restart: "no"
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      retries: 10
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+
+  # ------------------------------------------------------------------
+  # MLflow
+  # ------------------------------------------------------------------
+
   mlflow:
     image: ghcr.io/mlflow/mlflow:v2.13.0
+    ports:
+      - "5000:5000"
+    environment:
+      MLFLOW_BACKEND_STORE_URI: postgresql+psycopg2://mlflow:mlflow@airflow-db/mlflow
+      MLFLOW_DEFAULT_ARTIFACT_ROOT: s3://football-data/mlflow/artifacts
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      MLFLOW_S3_ENDPOINT_URL: http://moto-server:5000
     command: >
       mlflow server
-        --backend-store-uri sqlite:///mlflow/mlflow.db
-        --default-artifact-root /mlflow/artifacts
         --host 0.0.0.0
         --port 5000
-    volumes: [mlflow-data:/mlflow]
-    ports: ["5000:5000"]
-    networks: [pipeline]
+        --backend-store-uri postgresql+psycopg2://mlflow:mlflow@airflow-db/mlflow
+        --default-artifact-root s3://football-data/mlflow/artifacts
+    depends_on: [airflow-db, moto-server]
 
-  # ── Delta Lake storage (local dev; prod uses S3) ─────────────────────────────
-  delta-store:
-    image: alpine:3.19
-    volumes: [delta-data:/delta]
-    command: tail -f /dev/null
-    networks: [pipeline]
+  # ------------------------------------------------------------------
+  # v13 — Marquez (OpenLineage)
+  # ------------------------------------------------------------------
 
-  # ────────────────────────────────────────────────────────────────────────────
-  # v12 — Observability stack
-  # ────────────────────────────────────────────────────────────────────────────
+  # Marquez uses its own Postgres database.
+  marquez-db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: marquez
+      POSTGRES_PASSWORD: marquez
+      POSTGRES_DB: marquez
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "marquez"]
+      interval: 5s
+      retries: 10
+    volumes:
+      - marquez-db-data:/var/lib/postgresql/data
 
-  # Prometheus
+  marquez:
+    image: marquezproject/marquez:0.47.0
+    ports:
+      - "5002:5000"   # Marquez API  → http://localhost:5002
+      - "5003:5001"   # Marquez admin (health/metrics)
+    environment:
+      MARQUEZ_CONFIG: /opt/marquez/marquez.yml
+    volumes:
+      - ./lineage/marquez.yml:/opt/marquez/marquez.yml:ro
+    depends_on:
+      marquez-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/healthcheck"]
+      interval: 10s
+      retries: 15
+
+  marquez-web:
+    image: marquezproject/marquez-web:0.47.0
+    ports:
+      - "3001:3000"   # Marquez UI → http://localhost:3001
+    environment:
+      MARQUEZ_HOST: marquez
+      MARQUEZ_PORT: 5000
+    depends_on: [marquez]
+
+  # ------------------------------------------------------------------
+  # v12 — Observability
+  # ------------------------------------------------------------------
+
   prometheus:
     image: prom/prometheus:v2.52.0
-    command:
-      - --config.file=/etc/prometheus/prometheus.yml
-      - --storage.tsdb.path=/prometheus
-      - --storage.tsdb.retention.time=30d
-      - --web.enable-lifecycle          # POST /-/reload to hot-reload config
+    ports:
+      - "9090:9090"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
       - prometheus-data:/prometheus
-    ports: ["9090:9090"]
-    networks: [pipeline]
-    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=15d"
+      - "--web.enable-lifecycle"
 
-  # Grafana
   grafana:
-    image: grafana/grafana:11.0.0
+    image: grafana/grafana:10.4.3
+    ports:
+      - "3000:3000"
     environment:
-      GF_SECURITY_ADMIN_USER: admin
       GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
-      GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/football_pipeline.json
     volumes:
-      - grafana-data:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
       - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
-    ports: ["3000:3000"]
+      - grafana-data:/var/lib/grafana
     depends_on: [prometheus]
-    networks: [pipeline]
-    restart: unless-stopped
 
-  # Prometheus Pushgateway — lets short-lived Airflow tasks push metrics
   pushgateway:
     image: prom/pushgateway:v1.8.0
-    ports: ["9091:9091"]
-    networks: [pipeline]
-    restart: unless-stopped
+    ports:
+      - "9091:9091"
 
-  # Node exporter — host-level CPU, memory, disk metrics
   node-exporter:
     image: prom/node-exporter:v1.8.0
-    command:
-      - --path.rootfs=/host
-      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|run)($|/)
-    volumes:
-      - /:/host:ro,rslave
     pid: host
-    ports: ["9100:9100"]
-    networks: [pipeline]
-    restart: unless-stopped
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.ignored-mount-points=^/(sys|proc|dev|host|etc)($$|/)"
 
-  # PostgreSQL exporter
   postgres-exporter:
     image: prometheuscommunity/postgres-exporter:v0.15.0
     environment:
-      DATA_SOURCE_NAME: "postgresql://airflow:airflow@postgres:5432/airflow?sslmode=disable"
-    depends_on: [postgres]
-    ports: ["9187:9187"]
-    networks: [pipeline]
-    restart: unless-stopped
+      DATA_SOURCE_NAME: "postgresql://airflow:airflow@airflow-db:5432/airflow?sslmode=disable"
+    depends_on: [airflow-db]
+
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    command: ["--kafka.server=kafka:9092"]
+    depends_on: [kafka]
+
+volumes:
+  airflow-db-data:
+  kafka-data:
+  zookeeper-data:
+  prometheus-data:
+  grafana-data:
+  marquez-db-data:
