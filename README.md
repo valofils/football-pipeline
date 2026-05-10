@@ -1,192 +1,144 @@
-# football-pipeline-v7 — AWS (S3 + RDS) + Terraform
+# football-pipeline-v8 — Delta Lake on S3
 
-Lifts the pipeline into AWS. Adds one new skill layer on top of v6.
+> Builds on v7 (Kafka + Spark + Airflow + dbt + AWS S3/RDS + Terraform).
+> One new concept layer: **Delta Lake** replaces raw Parquet on S3.
 
-```
-v6 stack  +  S3 (Parquet lake)  +  RDS PostgreSQL  +  Terraform (IaC)
-```
+## What's new in v8
 
-Local Docker services unchanged: Kafka, Spark, Airflow, moto-server (local S3 mock).
-
----
-
-## What changed vs v6
-
-| Component | v6 | v7 |
+| Concern | v7 | v8 |
 |---|---|---|
-| Parquet lake | `data/parquet/` (local volume) | `s3a://bucket/parquet/` (S3) |
-| PostgreSQL | `football-db` Docker container | AWS RDS db.t3.micro |
-| Infrastructure | docker-compose only | docker-compose + Terraform |
-| New fixture | — | `s3_bucket` (moto mock) |
-| New test class | 7 classes / 35 tests | 8 classes / 40 tests |
-| New helpers | — | `s3a_path()` in spark_utils |
-| New JARs | `postgresql.jar` | + `hadoop-aws.jar` + `aws-java-sdk-bundle.jar` |
+| Storage format | Raw Parquet on S3 | **Delta Lake on S3** |
+| Upsert at storage | None (only at Postgres layer) | `MERGE INTO` via `DeltaTable.merge()` |
+| Schema enforcement | Spark StructType on read | Delta protocol + StructType |
+| Schema evolution | Manual | `mergeSchema` option |
+| Time travel | None | `versionAsOf` / `timestampAsOf` |
+| ACID transactions | None | Delta transaction log |
+| New JAR deps | — | `delta-spark_2.12-3.2.0.jar`, `delta-storage-3.2.0.jar` |
+| New Python dep | — | `delta-spark==3.2.0` |
 
----
+## Architecture
 
-## Prerequisites
+```
+CSV → Kafka producer
+         │
+         ▼
+    Kafka topic (football-matches)
+         │
+         ▼  kafka_ingest task
+    Delta Lake (s3a://bucket/delta/matches)   ◄── NEW
+         │              │
+         │              └─ _delta_log/ (ACID, time travel)
+         ▼  validate task
+    validate nulls (reads Delta)
+         │
+         ▼  load_postgres task
+    RDS PostgreSQL (matches table)
+         │
+         ▼  dbt_run task
+    dbt: stg_matches → standings (incremental)
+```
 
-- Docker + Docker Compose
-- Terraform ≥ 1.7 (`brew install terraform` / `apt install terraform`)
-- AWS CLI configured (`aws configure` or env vars)
-- Python 3.12 virtual environment
+## Key Delta mental models
 
----
+### Delta transaction log
+Every write appends a JSON entry to `_delta_log/`. This log is the source of
+truth for the table — Delta reconstructs the current snapshot by replaying it.
+Spark never modifies existing Parquet files; it only adds new ones.
+
+### MERGE INTO (storage-layer upsert)
+```python
+DeltaTable.forPath(spark, path)
+    .alias("existing")
+    .merge(new_df.alias("incoming"), "existing.match_id = incoming.match_id")
+    .whenMatchedUpdateAll()
+    .whenNotMatchedInsertAll()
+    .execute()
+```
+This is the Delta equivalent of PostgreSQL's `ON CONFLICT DO UPDATE`.
+It runs entirely at the storage layer — no Postgres required.
+
+### Time travel
+```python
+# Read the table as it was at version 0 (initial load)
+spark.read.format("delta").option("versionAsOf", 0).load(path)
+
+# Or by timestamp
+spark.read.format("delta").option("timestampAsOf", "2024-01-01").load(path)
+```
+Every `write_delta` / `merge_delta` call increments the version counter.
+
+### Why Delta over raw Parquet?
+| Problem with raw Parquet | Delta solution |
+|---|---|
+| Partial write = corrupt table | Atomic commits via log |
+| No upsert primitive | `MERGE INTO` |
+| Schema drift silently breaks reads | Schema enforcement + evolution |
+| No audit trail | Full history in `_delta_log/` |
+| Compaction is manual | `OPTIMIZE` + `ZORDER` commands |
 
 ## Quick start
 
-### 1 — Download JARs
-
 ```bash
-chmod +x scripts/get_jars.sh
-./scripts/get_jars.sh
+# 1. Download JARs (adds Delta JARs to spark/jars/)
+bash scripts/get_jars.sh
+
+# 2. Provision AWS infra (unchanged from v7)
+cd terraform && terraform init && terraform apply
+
+# 3. Export env vars (add to .env)
+export S3_BUCKET_NAME=<terraform output s3_bucket_name>
+export FOOTBALL_DB_HOST=<terraform output rds_host>
+export FOOTBALL_DB_USER=football
+export FOOTBALL_DB_PASSWORD=<your password>
+export AWS_ACCESS_KEY_ID=<your key>
+export AWS_SECRET_ACCESS_KEY=<your secret>
+
+# 4. Start services
+docker compose up -d
+
+# 5. Publish a CSV to Kafka
+python kafka/producer/produce_matches.py --file data/raw/matches.csv
+
+# 6. Trigger DAG
+airflow dags trigger football_pipeline
+
+# 7. Run tests
+pytest tests/ -v --cov=dags --cov-report=term-missing
 ```
 
-### 2 — Provision AWS infrastructure
+## Inspecting the Delta table
 
-```bash
-cd terraform
-cp terraform.tfvars.example terraform.tfvars
-# Edit terraform.tfvars: set bucket_name, local_cidr
-export TF_VAR_db_password="your-secure-password"
+```python
+from delta.tables import DeltaTable
+from dags.spark_utils import get_spark, delta_path
 
-terraform init
-terraform plan
-terraform apply          # ~5 min for RDS
+spark = get_spark()
+
+# Current snapshot
+df = spark.read.format("delta").load(delta_path("matches"))
+df.show()
+
+# History
+DeltaTable.forPath(spark, delta_path("matches")).history().show(truncate=False)
+
+# Time travel
+df_v0 = spark.read.format("delta").option("versionAsOf", 0).load(delta_path("matches"))
+df_v0.show()
 ```
 
-Note the outputs:
+## Full stack (v8)
 
-```
-s3_bucket_name = "football-pipeline-parquet-lake-xyz"
-rds_host       = "football-pipeline-db-dev.xxxx.eu-west-1.rds.amazonaws.com"
-rds_port       = 5432
-```
-
-### 3 — Bootstrap the RDS schema
-
-```bash
-export PGPASSWORD="your-secure-password"
-psql -h <rds_host> -U football_user -d football -f scripts/bootstrap_rds.sql
-```
-
-### 4 — Configure environment
-
-Create a `.env` file in the project root (git-ignored):
-
-```bash
-# .env
-FOOTBALL_DB_HOST=<rds_host from terraform output>
-FOOTBALL_DB_PORT=5432
-FOOTBALL_DB_NAME=football
-FOOTBALL_DB_USER=football_user
-FOOTBALL_DB_PASSWORD=your-secure-password
-
-AWS_ACCESS_KEY_ID=<your key>
-AWS_SECRET_ACCESS_KEY=<your secret>
-AWS_DEFAULT_REGION=eu-west-1
-S3_BUCKET_NAME=<bucket_name from terraform output>
-```
-
-### 5 — Start local services
-
-```bash
-docker compose --env-file .env up -d
-```
-
-### 6 — Publish test data to Kafka
-
-```bash
-python kafka/producer/produce_matches.py data/raw/matches.csv
-```
-
-### 7 — Trigger the DAG
-
-Open Airflow at http://localhost:8080 (admin / admin) and trigger `football_pipeline`.
-
----
-
-## Running tests
-
-Tests use moto to mock S3 — no real AWS calls needed:
-
-```bash
-pip install -r requirements.txt
-pytest tests/ -v --cov=dags --cov=kafka --cov-report=term-missing
-```
-
-Expected: **40 tests, 100% pass**.
-
----
-
-## Terraform teardown
-
-```bash
-cd terraform
-terraform destroy
-```
-
-This destroys the RDS instance and S3 bucket. The bucket must be empty first:
-
-```bash
-aws s3 rm s3://<bucket_name> --recursive
-terraform destroy
-```
-
----
-
-## Key mental models added in v7
-
-### S3 as a data lake
-- S3 stores objects under a flat key namespace; `/` in keys is just a naming convention
-- Spark's `s3a://` scheme (via `hadoop-aws`) treats S3 like a filesystem
-- Partitioned Parquet writes create `season=2023-24/` prefixes — Spark pushes filters down to skip irrelevant prefixes at read time
-
-### Terraform lifecycle
-- `terraform init` → download provider plugins
-- `terraform plan` → diff desired vs actual state (read-only)
-- `terraform apply` → converge actual to desired; updates `terraform.tfstate`
-- State file is the source of truth — never edit manually; commit to remote backend (S3 + DynamoDB lock) in production
-
-### IAM least-privilege
-- The pipeline role gets `s3:GetObject`, `s3:PutObject`, `s3:ListBucket` only on the specific bucket ARN
-- No `s3:*` wildcard — avoids accidental cross-bucket access
-
-### RDS vs Docker Postgres
-- Same PostgreSQL 16 engine; wire protocol identical — psycopg2 and JDBC work unchanged
-- RDS handles: automated backups, Multi-AZ failover, patching
-- `publicly_accessible = true` + `local_cidr` variable lets you connect directly during dev; set `false` in production and route via a bastion or VPN
-
-### moto for S3 unit tests
-- `@mock_aws` intercepts all boto3 / botocore calls — no real HTTP to AWS
-- `spark.hadoop.fs.s3a.endpoint` pointed at the moto server for Spark S3A calls
-- Pattern: session-scoped bucket fixture → test writes Parquet → test reads it back
-
----
-
-## Project structure
-
-```
-football-pipeline-v7/
-├── terraform/
-│   ├── main.tf                  # S3 bucket + RDS + IAM + VPC
-│   ├── variables.tf
-│   ├── outputs.tf
-│   └── terraform.tfvars.example
-├── dags/
-│   ├── football_pipeline.py     # DAG: kafka_ingest >> validate >> load_postgres >> dbt_run
-│   └── spark_utils.py           # SparkSession factory + s3a_path() helper
-├── kafka/
-│   ├── producer/produce_matches.py
-│   └── consumer/consume_matches.py
-├── dbt/                         # unchanged from v5/v6
-├── tests/
-│   ├── conftest.py              # + s3_bucket (moto) + aws_credentials fixtures
-│   └── test_dag.py              # 40 tests, 8 classes
-├── scripts/
-│   ├── get_jars.sh              # downloads postgresql + hadoop-aws + aws-java-sdk-bundle
-│   └── bootstrap_rds.sql        # DDL for RDS
-├── spark/jars/                  # JAR files (git-ignored)
-├── docker-compose.yaml          # + moto-server; football-db removed
-└── requirements.txt
-```
+| Layer | Technology |
+|---|---|
+| Language | Python 3.12 |
+| Messaging | Apache Kafka 3.7 · confluent-kafka 2.4.0 |
+| DataFrames | PySpark 3.5.1 |
+| **Storage format** | **Delta Lake 3.2.0** (replaces raw Parquet) |
+| Serialisation | JSON (messages) · PyArrow 15 · Parquet/Snappy (Delta files) |
+| Database | PostgreSQL 16 · psycopg2 · JDBC · AWS RDS |
+| Object storage | AWS S3 · hadoop-aws · s3a:// |
+| Modelling | dbt-core 1.8.3 · dbt-postgres |
+| Testing | pytest · pytest-cov · dbt test · moto |
+| Orchestration | Apache Airflow 2.9.1 · LocalExecutor · PostgresHook |
+| Compute | Apache Spark 3.5.1 standalone cluster |
+| Infrastructure | Docker Compose · Terraform 1.7+ |

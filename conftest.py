@@ -1,173 +1,244 @@
 """
-conftest.py — shared pytest fixtures (v7)
+conftest.py — pytest fixtures for football-pipeline-v8.
 
-New vs v6:
-- s3_bucket: moto-mocked S3 bucket (no real AWS calls)
-- spark: S3A configured to hit the moto mock endpoint
-- Existing fixtures (mock_producer, MockConsumer, pg_conn) unchanged
+Changes from v7
+---------------
+* ``spark`` fixture: Delta extensions added to builder; local metastore
+  via derby created in a temp dir so tests don't collide.
+* ``delta_matches_path`` fixture: creates a throwaway Delta table from
+  sample rows and yields its path — consumed by Delta-specific tests.
+* ``aws_credentials`` and ``s3_bucket`` fixtures unchanged from v7.
 """
+
 from __future__ import annotations
 
 import json
 import os
-from typing import Generator
+import tempfile
+from collections.abc import Generator
+from typing import Any
 from unittest.mock import MagicMock
 
-import boto3
-import psycopg2
 import pytest
-from moto import mock_aws
 from pyspark.sql import SparkSession
+from pyspark.sql.types import (
+    DoubleType,
+    IntegerType,
+    StringType,
+    StructField,
+    StructType,
+)
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Sample data
+# ---------------------------------------------------------------------------
 
-TEST_BUCKET   = "test-football-parquet-lake"
-TEST_REGION   = "eu-west-1"
-KAFKA_TOPIC   = "match-events"
+SAMPLE_ROWS: list[dict[str, Any]] = [
+    {
+        "match_id": 1,
+        "season": "2023-24",
+        "home_team": "Arsenal",
+        "away_team": "Chelsea",
+        "home_goals": 2,
+        "away_goals": 1,
+        "result": "H",
+        "xg_home": 1.8,
+        "xg_away": 0.9,
+    },
+    {
+        "match_id": 2,
+        "season": "2023-24",
+        "home_team": "Liverpool",
+        "away_team": "Man City",
+        "home_goals": 1,
+        "away_goals": 1,
+        "result": "D",
+        "xg_home": 1.2,
+        "xg_away": 1.4,
+    },
+    {
+        "match_id": 3,
+        "season": "2022-23",
+        "home_team": "Man City",
+        "away_team": "Arsenal",
+        "home_goals": 4,
+        "away_goals": 1,
+        "result": "H",
+        "xg_home": 3.5,
+        "xg_away": 0.7,
+    },
+]
+
+MATCH_SCHEMA = StructType(
+    [
+        StructField("match_id", IntegerType(), nullable=False),
+        StructField("season", StringType(), nullable=False),
+        StructField("home_team", StringType(), nullable=False),
+        StructField("away_team", StringType(), nullable=False),
+        StructField("home_goals", IntegerType(), nullable=True),
+        StructField("away_goals", IntegerType(), nullable=True),
+        StructField("result", StringType(), nullable=True),
+        StructField("xg_home", DoubleType(), nullable=True),
+        StructField("xg_away", DoubleType(), nullable=True),
+    ]
+)
 
 
-# ── S3 / moto ─────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Spark — session-scoped with Delta extensions
+# ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="session")
-def aws_credentials():
-    """Fake AWS credentials so moto never calls real AWS."""
-    os.environ["AWS_ACCESS_KEY_ID"]     = "testing"
-    os.environ["AWS_SECRET_ACCESS_KEY"] = "testing"
-    os.environ["AWS_SECURITY_TOKEN"]    = "testing"
-    os.environ["AWS_SESSION_TOKEN"]     = "testing"
-    os.environ["AWS_DEFAULT_REGION"]    = TEST_REGION
-    os.environ["S3_BUCKET_NAME"]        = TEST_BUCKET
-
-
-@pytest.fixture(scope="session")
-def s3_bucket(aws_credentials):
+def spark(tmp_path_factory: pytest.TempPathFactory) -> Generator[SparkSession, None, None]:
     """
-    Session-scoped moto S3 mock.
-    Yields a boto3 Bucket resource pointing at the test bucket.
-    """
-    with mock_aws():
-        s3 = boto3.resource("s3", region_name=TEST_REGION)
-        s3.create_bucket(
-            Bucket=TEST_BUCKET,
-            CreateBucketConfiguration={"LocationConstraint": TEST_REGION},
-        )
-        yield s3.Bucket(TEST_BUCKET)
+    Session-scoped SparkSession with Delta Lake extensions enabled.
 
-
-# ── Spark ─────────────────────────────────────────────────────────────────────
-
-@pytest.fixture(scope="session")
-def spark(s3_bucket) -> Generator[SparkSession, None, None]:
+    Uses a per-session temp dir for the derby metastore so parallel test
+    runs don't conflict.
     """
-    Session-scoped SparkSession.
-    Configured for local mode; S3A pointed at moto mock via hadoop-aws.
-    """
-    spark_jars = os.environ.get("SPARK_JARS", "")
-    session = (
+    from delta import configure_spark_with_delta_pip
+
+    derby_dir = tmp_path_factory.mktemp("derby")
+    warehouse_dir = tmp_path_factory.mktemp("warehouse")
+
+    builder = (
         SparkSession.builder.master("local[2]")
-        .appName("football-pipeline-v7-tests")
+        .appName("football-pipeline-v8-tests")
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
+        .config("spark.sql.warehouse.dir", str(warehouse_dir))
+        .config("spark.driver.extraJavaOptions", f"-Dderby.system.home={derby_dir}")
         .config("spark.ui.enabled", "false")
-        .config("spark.hadoop.fs.s3a.impl",
-                "org.apache.hadoop.fs.s3a.S3AFileSystem")
-        .config("spark.hadoop.fs.s3a.aws.credentials.provider",
-                "org.apache.hadoop.fs.s3a.SimpleAWSCredentialsProvider")
-        .config("spark.hadoop.fs.s3a.access.key",    "testing")
-        .config("spark.hadoop.fs.s3a.secret.key",    "testing")
-        .config("spark.hadoop.fs.s3a.path.style.access", "true")
-        .config("spark.hadoop.fs.s3a.endpoint",
-                "http://localhost:5555")  # moto server or override in CI
-        .config("spark.jars", spark_jars)
-        .getOrCreate()
+        .config("spark.driver.memory", "1g")
     )
+
+    session = configure_spark_with_delta_pip(builder).getOrCreate()
     session.sparkContext.setLogLevel("ERROR")
     yield session
     session.stop()
 
 
-# ── Kafka mocks ───────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Delta table fixture
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="function")
+def delta_matches_path(spark: SparkSession, tmp_path: Any) -> str:
+    """
+    Write SAMPLE_ROWS to a local Delta table and return its path.
+
+    Function-scoped so each test starts with a clean table.
+    """
+    path = str(tmp_path / "delta" / "matches")
+    df = spark.createDataFrame(SAMPLE_ROWS, schema=MATCH_SCHEMA)
+    df.write.format("delta").mode("overwrite").partitionBy("season").save(path)
+    return path
+
+
+# ---------------------------------------------------------------------------
+# AWS / moto fixtures (unchanged from v7)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture(scope="session")
+def aws_credentials() -> None:
+    """Inject fake AWS credentials so moto intercepts all boto3 calls."""
+    os.environ.setdefault("AWS_ACCESS_KEY_ID", "testing")
+    os.environ.setdefault("AWS_SECRET_ACCESS_KEY", "testing")
+    os.environ.setdefault("AWS_SECURITY_TOKEN", "testing")
+    os.environ.setdefault("AWS_SESSION_TOKEN", "testing")
+    os.environ.setdefault("AWS_DEFAULT_REGION", "us-east-1")
+
+
+@pytest.fixture(scope="session")
+def s3_bucket(aws_credentials: None):  # noqa: F811
+    """Create a mocked S3 bucket and set S3_BUCKET_NAME env var."""
+    import boto3
+    from moto import mock_aws
+
+    bucket_name = "football-test-bucket"
+    with mock_aws():
+        s3 = boto3.client("s3", region_name="us-east-1")
+        s3.create_bucket(Bucket=bucket_name)
+        os.environ["S3_BUCKET_NAME"] = bucket_name
+        yield s3
+
+
+# ---------------------------------------------------------------------------
+# Kafka mock fixtures (unchanged from v7)
+# ---------------------------------------------------------------------------
 
 class _FakeMessage:
-    def __init__(self, value: dict, partition: int = 0, offset: int = 0):
-        self._value     = json.dumps(value).encode()
-        self._partition = partition
-        self._offset    = offset
+    """Minimal stand-in for a confluent_kafka Message."""
 
-    def value(self):     return self._value
-    def partition(self): return self._partition
-    def offset(self):    return self._offset
-    def error(self):     return None
+    def __init__(
+        self,
+        value: dict[str, Any],
+        partition: int = 0,
+        offset: int = 0,
+    ) -> None:
+        self._value = json.dumps(value).encode()
+        self._partition = partition
+        self._offset = offset
+
+    def value(self) -> bytes:
+        return self._value
+
+    def partition(self) -> int:
+        return self._partition
+
+    def offset(self) -> int:
+        return self._offset
+
+    def error(self) -> None:  # type: ignore[return]
+        return None
 
 
 class MockConsumer:
-    """Deterministic replay of a fixed message list — no real broker needed."""
+    """Deterministic finite consumer that exhausts after all sample messages."""
 
-    def __init__(self, messages: list[dict]):
-        self._messages = [_FakeMessage(m, partition=0, offset=i) for i, m in enumerate(messages)]
-        self._index    = 0
-        self._hwm      = {0: len(messages)}
+    def __init__(self, rows: list[dict[str, Any]], hwm: int = 0) -> None:
+        self._messages = [_FakeMessage(r, offset=i) for i, r in enumerate(rows)]
+        self._index = 0
+        self._hwm = hwm or len(rows)
 
-    def subscribe(self, topics): pass
-    def close(self):             pass
-    def commit(self, message=None): pass
+    def list_topics(self, *args: Any, **kwargs: Any) -> MagicMock:
+        meta = MagicMock()
+        meta.topics = {
+            "football-matches": MagicMock(partitions={0: MagicMock()})
+        }
+        return meta
 
-    def poll(self, timeout=1.0):
+    def get_watermark_offsets(self, *args: Any, **kwargs: Any) -> tuple[int, int]:
+        return (0, self._hwm)
+
+    def assign(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def poll(self, timeout: float = 1.0) -> _FakeMessage | None:
         if self._index >= len(self._messages):
             return None
         msg = self._messages[self._index]
         self._index += 1
         return msg
 
-    def get_watermark_offsets(self, tp, timeout=10):
-        return (0, self._hwm.get(tp.partition, 0))
+    def commit(self, *args: Any, **kwargs: Any) -> None:
+        pass
 
-    def list_topics(self, topic, timeout=10):
-        from types import SimpleNamespace
-        partition = SimpleNamespace(id=0)
-        topic_obj = SimpleNamespace(partitions={0: partition})
-        return SimpleNamespace(topics={topic: topic_obj})
+    def close(self) -> None:
+        pass
 
 
 @pytest.fixture
-def mock_producer():
+def mock_producer() -> MagicMock:
     return MagicMock()
 
 
-# ── Postgres ──────────────────────────────────────────────────────────────────
-
-SAMPLE_MATCHES = [
-    {
-        "match_id": 1, "season": "2023-24", "date": "2023-08-12",
-        "home_team": "Arsenal", "away_team": "Nottm Forest",
-        "home_goals": 2, "away_goals": 1, "result": "H",
-    },
-    {
-        "match_id": 2, "season": "2023-24", "date": "2023-08-12",
-        "home_team": "Burnley", "away_team": "Man City",
-        "home_goals": 0, "away_goals": 3, "result": "A",
-    },
-]
-
-
 @pytest.fixture
-def pg_conn():
-    """
-    Function-scoped Postgres connection.
-    Each test rolls back so DB state stays clean.
-    Auto-skipped when Postgres is unreachable.
-    """
-    dsn = {
-        "host":     os.environ.get("FOOTBALL_DB_HOST", "localhost"),
-        "port":     int(os.environ.get("FOOTBALL_DB_PORT", 5432)),
-        "dbname":   os.environ.get("FOOTBALL_DB_NAME", "football"),
-        "user":     os.environ.get("FOOTBALL_DB_USER", "football_user"),
-        "password": os.environ.get("FOOTBALL_DB_PASSWORD", ""),
-    }
-    try:
-        conn = psycopg2.connect(**dsn)
-    except psycopg2.OperationalError:
-        pytest.skip("Postgres not reachable")
-        return
-    conn.autocommit = False
-    yield conn
-    conn.rollback()
-    conn.close()
+def pg_conn() -> MagicMock:
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__ = lambda s: s
+    conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    return conn

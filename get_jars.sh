@@ -1,31 +1,51 @@
 #!/usr/bin/env bash
-# Download JARs required by Spark for PostgreSQL JDBC + S3A access.
-# Run once before `docker compose up`.
+# scripts/get_jars.sh — download Spark JARs for football-pipeline-v8
+#
+# New in v8: delta-spark and delta-storage JARs added.
+#
+# Usage: bash scripts/get_jars.sh
+
 set -euo pipefail
 
-JARS_DIR="$(dirname "$0")/../spark/jars"
+JARS_DIR="${JARS_DIR:-spark/jars}"
 mkdir -p "$JARS_DIR"
 
-POSTGRES_JAR="https://jdbc.postgresql.org/download/postgresql-42.7.3.jar"
-HADOOP_AWS_JAR="https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar"
-AWS_SDK_JAR="https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.262/aws-java-sdk-bundle-1.12.262.jar"
+SCALA="2.12"
+SPARK_VERSION="3.5.1"
+DELTA_VERSION="3.2.0"
+HADOOP_VERSION="3.3.4"
+AWS_SDK_VERSION="1.12.262"
+PG_VERSION="42.7.3"
 
-download() {
-  local url="$1"
-  local dest="$JARS_DIR/$(basename "$url" | sed 's/-[0-9].*//' ).jar"
-  if [ -f "$dest" ]; then
-    echo "✓  $(basename "$dest") already present"
+BASE_MAVEN="https://repo1.maven.org/maven2"
+
+declare -A JARS=(
+  # PostgreSQL JDBC driver (v7+)
+  ["postgresql-${PG_VERSION}.jar"]="${BASE_MAVEN}/org/postgresql/postgresql/${PG_VERSION}/postgresql-${PG_VERSION}.jar"
+
+  # Hadoop S3A (v7+)
+  ["hadoop-aws-${HADOOP_VERSION}.jar"]="${BASE_MAVEN}/org/apache/hadoop/hadoop-aws/${HADOOP_VERSION}/hadoop-aws-${HADOOP_VERSION}.jar"
+
+  # AWS SDK bundle (v7+)
+  ["aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar"]="${BASE_MAVEN}/com/amazonaws/aws-java-sdk-bundle/${AWS_SDK_VERSION}/aws-java-sdk-bundle-${AWS_SDK_VERSION}.jar"
+
+  # Delta Lake core (v8 new)
+  ["delta-spark_${SCALA}-${DELTA_VERSION}.jar"]="${BASE_MAVEN}/io/delta/delta-spark_${SCALA}/${DELTA_VERSION}/delta-spark_${SCALA}-${DELTA_VERSION}.jar"
+
+  # Delta storage (v8 new) — required by delta-spark at runtime
+  ["delta-storage-${DELTA_VERSION}.jar"]="${BASE_MAVEN}/io/delta/delta-storage/${DELTA_VERSION}/delta-storage-${DELTA_VERSION}.jar"
+)
+
+for jar in "${!JARS[@]}"; do
+  target="${JARS_DIR}/${jar}"
+  if [[ -f "$target" ]]; then
+    echo "  [skip] $jar already present"
   else
-    echo "↓  Downloading $(basename "$url") …"
-    curl -sSL "$url" -o "$dest"
-    echo "✓  Saved to $dest"
+    echo "  [download] $jar"
+    curl -fsSL -o "$target" "${JARS[$jar]}"
   fi
-}
-
-download "$POSTGRES_JAR"
-download "$HADOOP_AWS_JAR"
-download "$AWS_SDK_JAR"
+done
 
 echo ""
-echo "All JARs ready in $JARS_DIR"
+echo "All JARs present in ${JARS_DIR}/"
 ls -lh "$JARS_DIR"

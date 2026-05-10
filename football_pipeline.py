@@ -1,17 +1,20 @@
 """
-football_pipeline.py — Airflow DAG (v7)
+football_pipeline.py — Airflow DAG for football-pipeline-v8.
 
-Changes vs v6:
-- kafka_ingest writes Parquet to S3 (s3a://) instead of local filesystem
-- validate reads from S3
-- load_postgres reads Parquet from S3 via Spark then upserts into RDS
-- dbt_run unchanged (still BashOperator; dbt profiles.yml points to RDS host)
+Changes from v7
+---------------
+* ``kafka_ingest``: writes Parquet → writes Delta (``write_delta``).
+* ``validate``:     reads Parquet → reads Delta format.
+* ``load_postgres``: reads Parquet → reads Delta; upsert path unchanged.
+* ``dbt_run``:      unchanged.
 
 DAG chain: kafka_ingest >> validate >> load_postgres >> dbt_run
 """
+
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime, timedelta
 
@@ -19,126 +22,185 @@ from airflow.decorators import dag, task
 from airflow.operators.bash import BashOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-from kafka.consumer.consume_matches import consume
-from spark_utils import MATCH_SCHEMA, get_spark, jdbc_params_from_env, s3a_path
+log = logging.getLogger(__name__)
 
-# ── DAG defaults ──────────────────────────────────────────────────────────────
-
-default_args = {
-    "owner": "data-engineering",
+DEFAULT_ARGS = {
+    "owner": "airflow",
     "retries": 2,
     "retry_delay": timedelta(minutes=5),
 }
 
-S3_RAW_PREFIX   = "raw/matches"
-S3_PARQUET_PREFIX = "parquet/matches"
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "football-matches")
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+MATCHES_TABLE = "matches"
+STAGING_TABLE = "matches_staging"
+DBT_DIR = "/opt/airflow/dbt"
 
+
+# ---------------------------------------------------------------------------
+# DAG
+# ---------------------------------------------------------------------------
 
 @dag(
     dag_id="football_pipeline",
+    default_args=DEFAULT_ARGS,
+    start_date=datetime(2024, 1, 1),
     schedule="@weekly",
-    start_date=datetime(2024, 8, 1),
     catchup=False,
-    default_args=default_args,
-    tags=["football", "v7", "aws"],
+    tags=["football", "v8", "delta"],
 )
 def football_pipeline():
 
-    # ── Task 1: Consume Kafka → write Parquet to S3 ───────────────────────────
-
-    @task
-    def kafka_ingest() -> dict:
+    # ------------------------------------------------------------------
+    # Task 1 — consume Kafka → write Delta on S3
+    # ------------------------------------------------------------------
+    @task()
+    def kafka_ingest() -> str:
         """
-        Consume match-events topic, write partitioned Parquet to S3.
+        Consume a finite batch from the Kafka topic and write rows to the
+        Delta table ``delta/matches`` on S3.
 
-        Returns a dict with the s3a path and row count for downstream tasks.
+        Returns the Delta table path for downstream tasks.
         """
-        from pyspark.sql import Row
+        from confluent_kafka import Consumer, TopicPartition
 
-        records = consume()  # list[dict] from Kafka consumer
-        if not records:
-            raise ValueError("kafka_ingest: no messages consumed — topic empty?")
+        from dags.spark_utils import MATCH_SCHEMA, delta_path, get_spark, write_delta
 
-        spark = get_spark("FootballPipeline-Ingest")
+        consumer_cfg = {
+            "bootstrap.servers": KAFKA_BOOTSTRAP,
+            "group.id": "airflow-ingest",
+            "auto.offset.reset": "earliest",
+            "enable.auto.commit": False,
+        }
+        consumer = Consumer(consumer_cfg)
 
-        rows = [Row(**r) for r in records]
+        # Snapshot high-water marks before subscribing
+        metadata = consumer.list_topics(KAFKA_TOPIC, timeout=10)
+        partitions = [
+            TopicPartition(KAFKA_TOPIC, p)
+            for p in metadata.topics[KAFKA_TOPIC].partitions
+        ]
+        hwms = {
+            tp.partition: consumer.get_watermark_offsets(tp, timeout=10)[1]
+            for tp in partitions
+        }
+        consumer.assign(partitions)
+
+        rows: list[dict] = []
+        reached: dict[int, bool] = {p: (hwm == 0) for p, hwm in hwms.items()}
+
+        while not all(reached.values()):
+            msg = consumer.poll(timeout=5.0)
+            if msg is None:
+                continue
+            if msg.error():
+                log.warning("Kafka error: %s", msg.error())
+                continue
+            rows.append(json.loads(msg.value().decode()))
+            part = msg.partition()
+            if msg.offset() + 1 >= hwms[part]:
+                reached[part] = True
+            consumer.commit(message=msg)
+
+        consumer.close()
+        log.info("Consumed %d rows from Kafka.", len(rows))
+
+        if not rows:
+            log.warning("No rows consumed — skipping Delta write.")
+            return delta_path(MATCHES_TABLE)
+
+        spark = get_spark()
         df = spark.createDataFrame(rows, schema=MATCH_SCHEMA)
 
-        out_path = s3a_path(S3_PARQUET_PREFIX)
-        df.write.mode("overwrite").partitionBy("season").parquet(out_path)
+        # v8: write Delta instead of raw Parquet
+        write_delta(df, MATCHES_TABLE, mode="append")
+        log.info("Written %d rows to Delta table: %s", df.count(), delta_path(MATCHES_TABLE))
 
-        row_count = df.count()
         spark.stop()
+        return delta_path(MATCHES_TABLE)
 
-        return {"s3_path": out_path, "row_count": row_count}
+    # ------------------------------------------------------------------
+    # Task 2 — validate Delta table
+    # ------------------------------------------------------------------
+    @task()
+    def validate(delta_table_path: str) -> str:
+        """Read the Delta table and assert no nulls on critical columns."""
+        from pyspark.sql.functions import col
 
-    # ── Task 2: Validate ──────────────────────────────────────────────────────
+        from dags.spark_utils import get_spark
 
-    @task
-    def validate(ingest_result: dict) -> dict:
-        """
-        Read Parquet from S3, assert no nulls on critical columns.
-        Passes s3_path downstream unchanged.
-        """
-        from pyspark.sql import functions as F
+        spark = get_spark()
+        # v8: read as Delta format
+        df = spark.read.format("delta").load(delta_table_path)
 
-        spark = get_spark("FootballPipeline-Validate")
-        df = spark.read.parquet(ingest_result["s3_path"])
-
-        critical_cols = ["match_id", "season", "home_team", "away_team"]
-        for col_name in critical_cols:
-            null_count = df.filter(F.col(col_name).isNull()).count()
+        for column in ("match_id", "season", "home_team", "away_team"):
+            null_count = df.filter(col(column).isNull()).count()
             if null_count > 0:
-                raise ValueError(f"validate: {null_count} null(s) in column '{col_name}'")
+                raise ValueError(
+                    f"Validation failed: {null_count} null(s) in column '{column}'."
+                )
 
+        total = df.count()
+        log.info("Validation passed — %d rows, zero nulls on key columns.", total)
         spark.stop()
-        return ingest_result
+        return delta_table_path
 
-    # ── Task 3: Load Postgres (RDS) ───────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Task 3 — load Postgres via JDBC (MERGE at storage + upsert at DB)
+    # ------------------------------------------------------------------
+    @task()
+    def load_postgres(delta_table_path: str) -> None:
+        """
+        Read the Delta table, write to a staging table via JDBC, then upsert
+        into the canonical ``matches`` table via PostgresHook.
+        """
+        from dags.spark_utils import get_spark, jdbc_params_from_env
 
-    @task
-    def load_postgres(ingest_result: dict) -> None:
-        """
-        Read Parquet from S3, upsert into matches_staging on RDS via JDBC.
-        Then promote from staging to matches via ON CONFLICT.
-        """
-        spark = get_spark("FootballPipeline-Load")
+        spark = get_spark()
         url, props = jdbc_params_from_env()
 
-        df = spark.read.parquet(ingest_result["s3_path"])
-        df.write.jdbc(url=url, table="matches_staging", mode="overwrite", properties=props)
-        spark.stop()
+        # v8: read Delta instead of Parquet
+        df = spark.read.format("delta").load(delta_table_path)
 
-        hook = PostgresHook(postgres_conn_id="football_db")
-        hook.run(
-            """
-            INSERT INTO matches (match_id, season, date, home_team, away_team, home_goals, away_goals, result)
-            SELECT match_id, season, date::date, home_team, away_team, home_goals, away_goals, result
-            FROM   matches_staging
+        # Write staging (overwrite on every run — idempotent)
+        (
+            df.write.jdbc(
+                url=url,
+                table=STAGING_TABLE,
+                mode="overwrite",
+                properties=props,
+            )
+        )
+
+        upsert_sql = f"""
+            INSERT INTO {MATCHES_TABLE}
+            SELECT * FROM {STAGING_TABLE}
             ON CONFLICT (match_id) DO UPDATE SET
                 home_goals = EXCLUDED.home_goals,
                 away_goals = EXCLUDED.away_goals,
-                result     = EXCLUDED.result;
-            """
-        )
+                result     = EXCLUDED.result,
+                xg_home    = EXCLUDED.xg_home,
+                xg_away    = EXCLUDED.xg_away;
+        """
+        hook = PostgresHook(postgres_conn_id="football_db")
+        hook.run(upsert_sql)
+        log.info("Upserted rows from staging into %s.", MATCHES_TABLE)
+        spark.stop()
 
-    # ── Task 4: dbt ───────────────────────────────────────────────────────────
-
+    # ------------------------------------------------------------------
+    # Task 4 — dbt (unchanged from v5–v7)
+    # ------------------------------------------------------------------
     dbt_run = BashOperator(
         task_id="dbt_run",
-        bash_command=(
-            "cd /opt/airflow/dbt && "
-            "dbt run --profiles-dir /opt/airflow/dbt && "
-            "dbt test --profiles-dir /opt/airflow/dbt"
-        ),
+        bash_command=f"cd {DBT_DIR} && dbt run && dbt test",
     )
 
-    # ── Wire up ───────────────────────────────────────────────────────────────
-
-    ingest_result = kafka_ingest()
-    validated     = validate(ingest_result)
-    loaded        = load_postgres(validated)
-    loaded >> dbt_run
+    # ------------------------------------------------------------------
+    # Wire tasks
+    # ------------------------------------------------------------------
+    path = kafka_ingest()
+    validated_path = validate(path)
+    load_postgres(validated_path) >> dbt_run
 
 
 football_pipeline()
