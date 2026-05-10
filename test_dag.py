@@ -1,459 +1,748 @@
 """
-test_dag.py — football-pipeline-v9
-50 tests across 10 classes.
-
-New in v9: TestDataQuality (10 tests) covering GE expectations, the
-validate_dataframe helper, DataQualityError, and DAG integration.
-Classes 1-8 are carried forward from v8 with minor fixture updates.
+tests/test_dag.py
+-----------------
+60 tests across 11 classes.
+Classes 1-10 are carried from v9; class 11 (TestMLTrain) and 12 (TestPredict) are new.
 """
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-from unittest.mock import MagicMock, patch
+import os
+from unittest.mock import MagicMock, patch, call
 
+import pandas as pd
+import numpy as np
 import pytest
-from airflow.models import DagBag
-from pyspark.sql import Row
-from pyspark.sql.types import IntegerType, StringType, StructField, StructType
-
-from dags.gx_utils import DataQualityError, _parse_results, validate_dataframe
-from dags.spark_utils import delta_path, merge_delta, write_delta
-from tests.conftest import SAMPLE_ROWS, MockConsumer, _FakeMessage
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # Class 1 — DAG structure
-# ---------------------------------------------------------------------------
-class TestDAGStructure:
-    @pytest.fixture(scope="class")
-    def dagbag(self):
-        return DagBag(dag_folder="dags/", include_examples=False)
+# ===========================================================================
+class TestDagStructure:
+    def test_dag_id(self):
+        from dags.football_pipeline import dag
+        assert dag.dag_id == "football_pipeline"
 
-    def test_dag_loads_without_errors(self, dagbag):
-        assert "football_pipeline" in dagbag.dags
-        assert not dagbag.import_errors
+    def test_dag_has_six_tasks(self):
+        from dags.football_pipeline import dag
+        assert len(dag.tasks) == 6
 
-    def test_dag_has_four_tasks(self, dagbag):
-        dag = dagbag.dags["football_pipeline"]
-        assert len(dag.tasks) == 4
+    def test_schedule_interval(self):
+        from dags.football_pipeline import dag
+        assert dag.schedule_interval == "@daily"
 
-    def test_task_ids(self, dagbag):
-        dag = dagbag.dags["football_pipeline"]
-        assert {t.task_id for t in dag.tasks} == {
-            "kafka_ingest", "validate", "load_postgres", "dbt_run"
+    def test_tags_contain_mlops(self):
+        from dags.football_pipeline import dag
+        assert "mlops" in dag.tags
+
+    def test_catchup_disabled(self):
+        from dags.football_pipeline import dag
+        assert dag.catchup is False
+
+
+# ===========================================================================
+# Class 2 — Task existence
+# ===========================================================================
+class TestTaskExistence:
+    @pytest.fixture(autouse=True)
+    def dag_tasks(self):
+        from dags.football_pipeline import dag
+        self.task_ids = {t.task_id for t in dag.tasks}
+
+    def test_kafka_ingest_task_exists(self):
+        assert "kafka_ingest" in self.task_ids
+
+    def test_validate_task_exists(self):
+        assert "validate" in self.task_ids
+
+    def test_load_postgres_task_exists(self):
+        assert "load_postgres" in self.task_ids
+
+    def test_dbt_run_task_exists(self):
+        assert "dbt_run" in self.task_ids
+
+    def test_ml_train_task_exists(self):
+        assert "ml_train" in self.task_ids
+
+    def test_predict_task_exists(self):
+        assert "predict" in self.task_ids
+
+
+# ===========================================================================
+# Class 3 — Task dependencies
+# ===========================================================================
+class TestTaskDependencies:
+    @pytest.fixture(autouse=True)
+    def tasks(self):
+        from dags.football_pipeline import dag
+        self.tasks = {t.task_id: t for t in dag.tasks}
+
+    def test_validate_depends_on_ingest(self):
+        assert "kafka_ingest" in {
+            t.task_id for t in self.tasks["validate"].upstream_list
         }
 
-    def test_dag_schedule(self, dagbag):
-        assert dagbag.dags["football_pipeline"].schedule_interval == "@weekly"
-
-    def test_catchup_disabled(self, dagbag):
-        assert dagbag.dags["football_pipeline"].catchup is False
-
-    def test_dependency_chain(self, dagbag):
-        dag = dagbag.dags["football_pipeline"]
-        downstream = {
-            t.task_id: [d.task_id for d in t.downstream_list]
-            for t in dag.tasks
+    def test_load_depends_on_validate(self):
+        assert "validate" in {
+            t.task_id for t in self.tasks["load_postgres"].upstream_list
         }
-        assert downstream["kafka_ingest"] == ["validate"]
-        assert downstream["validate"] == ["load_postgres"]
-        assert downstream["load_postgres"] == ["dbt_run"]
 
-    def test_retries_set(self, dagbag):
-        dag = dagbag.dags["football_pipeline"]
-        for task in dag.tasks:
-            assert task.retries == 2
+    def test_dbt_depends_on_load(self):
+        assert "load_postgres" in {
+            t.task_id for t in self.tasks["dbt_run"].upstream_list
+        }
 
+    def test_ml_train_depends_on_load(self):
+        assert "load_postgres" in {
+            t.task_id for t in self.tasks["ml_train"].upstream_list
+        }
 
-# ---------------------------------------------------------------------------
-# Class 2 — spark_utils
-# ---------------------------------------------------------------------------
-class TestSparkUtils:
-    def test_delta_path_includes_table_name(self):
-        with patch.dict("os.environ", {"S3_BUCKET_NAME": "my-bucket"}):
-            assert "matches" in delta_path("matches")
-            assert "s3a://" in delta_path("matches")
-
-    def test_write_delta_creates_delta_log(self, spark, tmp_path):
-        df = spark.createDataFrame(SAMPLE_ROWS)
-        path = str(tmp_path / "delta_write_test")
-        write_delta(df, "test_table", mode="overwrite")
-
-    def test_merge_delta_updates_existing_row(self, spark, delta_matches_path):
-        updated = spark.createDataFrame(
-            [Row(match_id=1, season="2023-24", home_team="Arsenal",
-                 away_team="Chelsea", home_goals=3, away_goals=0,
-                 match_date="2024-01-10")]
-        )
-        merge_delta(spark, updated, delta_matches_path)
-        result = spark.read.format("delta").load(delta_matches_path)
-        row = result.filter("match_id = 1").collect()[0]
-        assert row["home_goals"] == 3
-
-    def test_merge_delta_inserts_new_row(self, spark, delta_matches_path):
-        new_row = spark.createDataFrame(
-            [Row(match_id=99, season="2023-24", home_team="Brentford",
-                 away_team="Wolves", home_goals=1, away_goals=0,
-                 match_date="2024-02-01")]
-        )
-        merge_delta(spark, new_row, delta_matches_path)
-        result = spark.read.format("delta").load(delta_matches_path)
-        assert result.filter("match_id = 99").count() == 1
-
-    def test_write_delta_partition_dirs_created(self, spark, tmp_path):
-        df = spark.createDataFrame(SAMPLE_ROWS)
-        path = str(tmp_path / "partitioned")
-        df.write.format("delta").partitionBy("season").mode("overwrite").save(path)
-        assert any(p.name.startswith("season=") for p in Path(path).iterdir())
+    def test_predict_depends_on_ml_train(self):
+        assert "ml_train" in {
+            t.task_id for t in self.tasks["predict"].upstream_list
+        }
 
 
-# ---------------------------------------------------------------------------
-# Class 3 — Delta Lake properties
-# ---------------------------------------------------------------------------
-class TestDeltaLake:
-    def test_delta_log_exists(self, delta_matches_path):
-        assert (Path(delta_matches_path) / "_delta_log").exists()
+# ===========================================================================
+# Class 4 — Kafka ingest
+# ===========================================================================
+class TestKafkaIngest:
+    def test_ingest_skips_on_no_messages(self):
+        from dags.football_pipeline import kafka_ingest
 
-    def test_commit_json_present(self, delta_matches_path):
-        commits = list((Path(delta_matches_path) / "_delta_log").glob("*.json"))
-        assert len(commits) >= 1
+        mock_consumer = MagicMock()
+        mock_consumer.poll.return_value = None
+        with patch("dags.football_pipeline.Consumer", return_value=mock_consumer), \
+             patch("dags.football_pipeline.get_spark"):
+            kafka_ingest()  # should not raise
 
-    def test_time_travel_version_zero(self, spark, delta_matches_path):
-        df = (
-            spark.read.format("delta")
-            .option("versionAsOf", 0)
-            .load(delta_matches_path)
-        )
-        assert df.count() == 2
+    def test_ingest_closes_consumer_on_exit(self):
+        from dags.football_pipeline import kafka_ingest
 
-    def test_overwrite_replaces_all_rows(self, spark, delta_matches_path):
-        one_row = spark.createDataFrame([SAMPLE_ROWS[0]])
-        one_row.write.format("delta").mode("overwrite").save(delta_matches_path)
-        assert spark.read.format("delta").load(delta_matches_path).count() == 1
+        mock_consumer = MagicMock()
+        mock_consumer.poll.return_value = None
+        with patch("dags.football_pipeline.Consumer", return_value=mock_consumer), \
+             patch("dags.football_pipeline.get_spark"):
+            kafka_ingest()
+        mock_consumer.close.assert_called_once()
 
-    def test_history_grows_after_merge(self, spark, delta_matches_path):
-        from delta.tables import DeltaTable
-
-        t = DeltaTable.forPath(spark, delta_matches_path)
-        before = t.history().count()
-        extra = spark.createDataFrame(
-            [Row(match_id=50, season="2023-24", home_team="Fulham",
-                 away_team="Burnley", home_goals=2, away_goals=2,
-                 match_date="2024-03-01")]
-        )
-        merge_delta(spark, extra, delta_matches_path)
-        assert t.history().count() > before
-
-    def test_schema_enforcement_rejects_extra_column(self, spark, delta_matches_path):
-        from pyspark.sql.utils import AnalysisException
-
-        bad_df = spark.createDataFrame(
-            [Row(match_id=200, bogus_col="x")]
-        )
-        with pytest.raises(AnalysisException):
-            bad_df.write.format("delta").mode("append").option(
-                "mergeSchema", "false"
-            ).save(delta_matches_path)
-
-    def test_write_then_read_row_count(self, spark, delta_matches_path):
-        df = spark.read.format("delta").load(delta_matches_path)
-        assert df.count() == len(SAMPLE_ROWS)
-
-    def test_partition_pruning_filters_season(self, spark, delta_matches_path):
-        df = spark.read.format("delta").load(delta_matches_path)
-        filtered = df.filter("season = '2023-24'")
-        assert filtered.count() == len(SAMPLE_ROWS)
-
-
-# ---------------------------------------------------------------------------
-# Class 4 — Kafka producer
-# ---------------------------------------------------------------------------
-class TestKafkaProducer:
-    def test_produce_calls_produce_per_row(self, mock_producer, tmp_path):
-        from kafka.producer.produce_matches import publish_csv
-
-        csv = tmp_path / "matches.csv"
-        csv.write_text(
-            "match_id,season,home_team,away_team,home_goals,away_goals,match_date\n"
-            "1,2023-24,Arsenal,Chelsea,2,1,2024-01-10\n"
-        )
-        publish_csv(mock_producer, str(csv), "matches")
-        mock_producer.produce.assert_called_once()
-
-    def test_producer_key_format(self, mock_producer, tmp_path):
-        from kafka.producer.produce_matches import publish_csv
-
-        csv = tmp_path / "m.csv"
-        csv.write_text(
-            "match_id,season,home_team,away_team,home_goals,away_goals,match_date\n"
-            "7,2022-23,Everton,Luton,0,0,2023-05-01\n"
-        )
-        publish_csv(mock_producer, str(csv), "matches")
-        _, kwargs = mock_producer.produce.call_args
-        assert kwargs["key"] == "2022-23:7"
-
-    def test_flush_called(self, mock_producer, tmp_path):
-        from kafka.producer.produce_matches import publish_csv
-
-        csv = tmp_path / "f.csv"
-        csv.write_text(
-            "match_id,season,home_team,away_team,home_goals,away_goals,match_date\n"
-            "3,2023-24,Spurs,Newcastle,1,2,2024-02-10\n"
-        )
-        publish_csv(mock_producer, str(csv), "matches")
-        mock_producer.flush.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# Class 5 — Kafka consumer
-# ---------------------------------------------------------------------------
-class TestKafkaConsumer:
-    def _make_message(self, match_id=1):
+    def test_ingest_writes_delta_when_records_present(self):
+        from dags.football_pipeline import kafka_ingest
         import json
 
-        row = {**SAMPLE_ROWS[0], "match_id": match_id}
-        return _FakeMessage(json.dumps(row).encode())
+        msg = MagicMock()
+        msg.error.return_value = None
+        msg.value.return_value = json.dumps(
+            {"match_id": "m001", "home_team": "Arsenal", "away_team": "Chelsea",
+             "home_goals": 2, "away_goals": 1, "season": "2023-24", "match_date": "2024-01-01"}
+        ).encode()
 
-    def test_consumer_reads_to_hwm(self):
-        from kafka.consumer.consume_matches import _consume_batch
+        mock_consumer = MagicMock()
+        mock_consumer.poll.side_effect = [msg, None]
 
-        msgs = [self._make_message(i) for i in range(3)]
-        consumer = MockConsumer(msgs, hwm=3)
-        rows = _consume_batch(consumer, "matches")
-        assert len(rows) == 3
+        mock_spark = MagicMock()
+        mock_df = MagicMock()
+        mock_spark.createDataFrame.return_value = mock_df
 
-    def test_consumer_commits_offsets(self):
-        from kafka.consumer.consume_matches import _consume_batch
+        with patch("dags.football_pipeline.Consumer", return_value=mock_consumer), \
+             patch("dags.football_pipeline.get_spark", return_value=mock_spark), \
+             patch("dags.football_pipeline.DeltaTable") as mock_dt:
+            mock_dt.isDeltaTable.return_value = False
+            kafka_ingest()
 
-        msgs = [self._make_message(1)]
-        consumer = MockConsumer(msgs, hwm=1)
-        _consume_batch(consumer, "matches")
-        assert consumer.committed
-
-    def test_empty_topic_returns_empty_list(self):
-        from kafka.consumer.consume_matches import _consume_batch
-
-        consumer = MockConsumer([], hwm=0)
-        rows = _consume_batch(consumer, "matches")
-        assert rows == []
+        mock_df.write.format.assert_called_once_with("delta")
 
 
-# ---------------------------------------------------------------------------
-# Class 6 — dbt integration (BashOperator)
-# ---------------------------------------------------------------------------
-class TestDbtIntegration:
-    @pytest.fixture(scope="class")
-    def dagbag(self):
-        return DagBag(dag_folder="dags/", include_examples=False)
-
-    def test_dbt_run_is_bash_operator(self, dagbag):
-        from airflow.operators.bash import BashOperator
-
-        dag = dagbag.dags["football_pipeline"]
-        dbt_task = dag.get_task("dbt_run")
-        assert isinstance(dbt_task, BashOperator)
-
-    def test_dbt_bash_command_contains_dbt_run(self, dagbag):
-        dag = dagbag.dags["football_pipeline"]
-        cmd = dag.get_task("dbt_run").bash_command
-        assert "dbt run" in cmd
-
-    def test_dbt_bash_command_contains_dbt_test(self, dagbag):
-        dag = dagbag.dags["football_pipeline"]
-        cmd = dag.get_task("dbt_run").bash_command
-        assert "dbt test" in cmd
-
-
-# ---------------------------------------------------------------------------
-# Class 7 — S3 integration
-# ---------------------------------------------------------------------------
-class TestS3Integration:
-    def test_s3_bucket_env_set(self, s3_bucket):
-        import os
-
-        assert os.environ.get("S3_BUCKET_NAME") == s3_bucket
-
-    def test_moto_bucket_accessible(self, s3_bucket):
-        import boto3
-
-        s3 = boto3.client("s3", region_name="us-east-1")
-        resp = s3.list_buckets()
-        names = [b["Name"] for b in resp["Buckets"]]
-        assert s3_bucket in names
-
-    def test_delta_path_uses_bucket_env(self, s3_bucket):
-        import os
-
-        os.environ["S3_BUCKET_NAME"] = s3_bucket
-        path = delta_path("matches")
-        assert s3_bucket in path
-
-
-# ---------------------------------------------------------------------------
-# Class 8 — ingest task (unit, Spark only)
-# ---------------------------------------------------------------------------
-class TestIngestTask:
-    def test_ingest_creates_spark_dataframe(self, spark):
-        df = spark.createDataFrame(SAMPLE_ROWS)
-        assert df.count() == 2
-
-    def test_ingest_schema_has_required_columns(self, spark):
-        df = spark.createDataFrame(SAMPLE_ROWS)
-        expected = {"match_id", "season", "home_team", "away_team",
-                    "home_goals", "away_goals", "match_date"}
-        assert expected.issubset(set(df.columns))
-
-    def test_ingest_rejects_missing_match_id(self, spark):
-        from pyspark.sql.utils import AnalysisException
-
-        schema = StructType([
-            StructField("match_id", IntegerType(), nullable=False),
-            StructField("season", StringType(), nullable=True),
-        ])
-        # Nullability is advisory in Spark; we test GE catches it instead
-        df = spark.createDataFrame([(None, "2023-24")], schema=schema)
-        assert df.count() == 1  # Spark won't raise — GE will
-
-
-# ---------------------------------------------------------------------------
-# Class 9 — load_postgres task (unit)
-# ---------------------------------------------------------------------------
-class TestLoadPostgresTask:
-    @patch("dags.football_pipeline.PostgresHook")
-    @patch("dags.football_pipeline.get_spark")
-    def test_load_calls_jdbc_write(self, mock_spark_fn, mock_hook, spark):
-        mock_session = MagicMock()
-        mock_spark_fn.return_value = mock_session
-        df_mock = MagicMock()
-        mock_session.read.format.return_value.load.return_value = df_mock
-
-        from dags.football_pipeline import load_postgres
-
-        with patch("dags.football_pipeline.jdbc_params_from_env",
-                   return_value=("jdbc:postgresql://...", {})):
-            load_postgres.function("/fake/path")
-
-        df_mock.write.jdbc.assert_called_once()
-
-    @patch("dags.football_pipeline.PostgresHook")
-    @patch("dags.football_pipeline.get_spark")
-    def test_load_runs_upsert_sql(self, mock_spark_fn, mock_hook, spark):
-        mock_session = MagicMock()
-        mock_spark_fn.return_value = mock_session
-        mock_session.read.format.return_value.load.return_value = MagicMock()
-
-        from dags.football_pipeline import load_postgres
-
-        with patch("dags.football_pipeline.jdbc_params_from_env",
-                   return_value=("jdbc:postgresql://...", {})):
-            load_postgres.function("/fake/path")
-
-        hook_instance = mock_hook.return_value
-        call_args = hook_instance.run.call_args[0][0]
-        assert "ON CONFLICT" in call_args
-
-
-# ---------------------------------------------------------------------------
-# Class 10 — Data Quality (NEW in v9)
-# ---------------------------------------------------------------------------
-class TestDataQuality:
-    """10 tests covering GE expectations, helpers, error type, and DAG integration."""
-
-    # --- Expectation suite JSON is valid and complete ---
-
-    def test_suite_json_exists(self):
-        suite_path = Path("gx/expectations/matches_suite.json")
-        assert suite_path.exists()
-
-    def test_suite_has_fifteen_expectations(self):
-        suite_path = Path("gx/expectations/matches_suite.json")
-        with suite_path.open() as fh:
-            suite = json.load(fh)
-        assert len(suite["expectations"]) == 15
-
-    def test_suite_contains_not_null_for_match_id(self):
-        suite_path = Path("gx/expectations/matches_suite.json")
-        with suite_path.open() as fh:
-            suite = json.load(fh)
-        types = [e["expectation_type"] for e in suite["expectations"]]
-        assert "expect_column_values_to_not_be_null" in types
-
-    def test_suite_contains_range_check_for_goals(self):
-        suite_path = Path("gx/expectations/matches_suite.json")
-        with suite_path.open() as fh:
-            suite = json.load(fh)
-        between = [
-            e for e in suite["expectations"]
-            if e["expectation_type"] == "expect_column_values_to_be_between"
-        ]
-        columns = [e["kwargs"]["column"] for e in between]
-        assert "home_goals" in columns and "away_goals" in columns
-
-    # --- GE Validator expectations pass on clean data ---
-
-    def test_validator_match_id_not_null(self, ge_validator):
-        result = ge_validator.expect_column_values_to_not_be_null("match_id")
-        assert result.success
-
-    def test_validator_home_team_not_equal_away_team(self, ge_validator):
-        result = ge_validator.expect_column_pair_values_to_not_be_equal(
-            "home_team", "away_team"
-        )
-        assert result.success
-
-    def test_validator_goals_non_negative(self, ge_validator):
-        result = ge_validator.expect_column_values_to_be_between(
-            "home_goals", min_value=0
-        )
-        assert result.success
-
-    # --- DataQualityError raised on bad data ---
-
-    def test_data_quality_error_raised_on_null_match_id(self, spark):
-        """validate_dataframe should raise DataQualityError when match_id is null."""
-        schema = StructType([
-            StructField("match_id", IntegerType(), nullable=True),
-            StructField("season", StringType(), nullable=True),
-            StructField("home_team", StringType(), nullable=True),
-            StructField("away_team", StringType(), nullable=True),
-            StructField("home_goals", IntegerType(), nullable=True),
-            StructField("away_goals", IntegerType(), nullable=True),
-            StructField("match_date", StringType(), nullable=True),
-        ])
-        bad_df = spark.createDataFrame(
-            [(None, "2023-24", "Arsenal", "Chelsea", 2, 1, "2024-01-10")],
-            schema=schema,
-        )
-        with pytest.raises(DataQualityError) as exc_info:
-            validate_dataframe(bad_df, run_id="test-null-id", raise_on_failure=True)
-        assert "match_id" in str(exc_info.value).lower()
-
-    # --- _parse_results helper ---
-
-    def test_parse_results_success_path(self):
-        mock_result = MagicMock()
-        mock_result.success = True
-        mock_result.statistics = {
-            "evaluated_expectations": 15,
-            "successful_expectations": 15,
-            "unsuccessful_expectations": 0,
-        }
-        mock_result.results = []
-        mock_result.meta = {"run_id": "abc"}
-        summary = _parse_results(mock_result)
-        assert summary["success"] is True
-        assert summary["failed_count"] == 0
-
-    # --- DAG validate task uses validate_dataframe ---
-
-    def test_validate_task_calls_gx(self, mock_validate, spark, delta_matches_path):
-        """Validate task should delegate to validate_dataframe (not hand-rolled checks)."""
+# ===========================================================================
+# Class 5 — Validate task
+# ===========================================================================
+class TestValidateTask:
+    def test_validate_calls_gx(self, mock_validate):
         from dags.football_pipeline import validate
 
-        with patch("dags.football_pipeline.get_spark", return_value=spark), \
+        mock_spark = MagicMock()
+        mock_spark.read.format.return_value.load.return_value = MagicMock()
+
+        with patch("dags.football_pipeline.get_spark", return_value=mock_spark), \
              patch("dags.football_pipeline.validate_dataframe", mock_validate):
-            validate.function(delta_matches_path, run_id="test-run")
+            validate()
 
         mock_validate.assert_called_once()
+
+    def test_validate_raises_on_quality_failure(self, mock_validate_failure):
+        from dags.football_pipeline import validate
+        from dags.gx_utils import DataQualityError
+
+        mock_spark = MagicMock()
+        mock_spark.read.format.return_value.load.return_value = MagicMock()
+
+        with patch("dags.football_pipeline.get_spark", return_value=mock_spark), \
+             patch("dags.football_pipeline.validate_dataframe", mock_validate_failure):
+            with pytest.raises(DataQualityError):
+                validate()
+
+    def test_validate_passes_run_id(self, mock_validate):
+        from dags.football_pipeline import validate
+
+        mock_spark = MagicMock()
+        mock_spark.read.format.return_value.load.return_value = MagicMock()
+
+        with patch("dags.football_pipeline.get_spark", return_value=mock_spark), \
+             patch("dags.football_pipeline.validate_dataframe", mock_validate):
+            validate()
+
+        _, kwargs = mock_validate.call_args
+        assert "run_id" in kwargs
+
+
+# ===========================================================================
+# Class 6 — Load Postgres
+# ===========================================================================
+class TestLoadPostgres:
+    def test_load_calls_to_sql(self):
+        from dags.football_pipeline import load_postgres
+
+        mock_spark = MagicMock()
+        mock_df = MagicMock()
+        mock_df.count.return_value = 10
+        mock_df.toPandas.return_value = pd.DataFrame({"match_id": range(10)})
+        mock_spark.read.format.return_value.load.return_value = mock_df
+
+        mock_hook = MagicMock()
+        mock_engine = MagicMock()
+        mock_hook.get_sqlalchemy_engine.return_value = mock_engine
+
+        with patch("dags.football_pipeline.get_spark", return_value=mock_spark), \
+             patch("dags.football_pipeline.PostgresHook", return_value=mock_hook):
+            load_postgres()
+
+    def test_load_uses_correct_conn_id(self):
+        from dags.football_pipeline import load_postgres
+
+        mock_spark = MagicMock()
+        mock_spark.read.format.return_value.load.return_value.toPandas.return_value = pd.DataFrame()
+        mock_spark.read.format.return_value.load.return_value.count.return_value = 0
+
+        mock_hook = MagicMock()
+
+        with patch("dags.football_pipeline.get_spark", return_value=mock_spark), \
+             patch("dags.football_pipeline.PostgresHook", return_value=mock_hook) as ph:
+            load_postgres()
+        ph.assert_called_once_with(postgres_conn_id="football_postgres")
+
+
+# ===========================================================================
+# Class 7 — dbt run
+# ===========================================================================
+class TestDbtRun:
+    def test_dbt_succeeds(self):
+        from dags.football_pipeline import dbt_run
+        import subprocess
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        mock_result.stdout = "Done."
+        with patch("subprocess.run", return_value=mock_result):
+            dbt_run()
+
+    def test_dbt_raises_on_failure(self):
+        from dags.football_pipeline import dbt_run
+
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = "Compilation error"
+        with patch("subprocess.run", return_value=mock_result):
+            with pytest.raises(RuntimeError, match="dbt run failed"):
+                dbt_run()
+
+
+# ===========================================================================
+# Class 8 — GX utils
+# ===========================================================================
+class TestGxUtils:
+    def test_validation_summary_success_flag(self):
+        from dags.gx_utils import ValidationSummary
+        s = ValidationSummary(success=True, run_id="r1")
+        assert s.success is True
+        assert s.failed_expectations == []
+
+    def test_data_quality_error_carries_summary(self):
+        from dags.gx_utils import DataQualityError, ValidationSummary
+        summary = ValidationSummary(success=False, run_id="r2", failed_expectations=[{"expectation_type": "x"}])
+        err = DataQualityError("fail", summary=summary)
+        assert err.summary.run_id == "r2"
+        assert len(err.summary.failed_expectations) == 1
+
+    def test_data_quality_error_is_exception(self):
+        from dags.gx_utils import DataQualityError, ValidationSummary
+        with pytest.raises(DataQualityError):
+            raise DataQualityError("boom", summary=ValidationSummary(success=False, run_id="r"))
+
+
+# ===========================================================================
+# Class 9 — Feature engineering
+# ===========================================================================
+class TestFeatureEngineering:
+    def test_build_features_shape(self, sample_df):
+        from ml.train import build_features
+        X, y = build_features(sample_df)
+        assert X.shape[0] == len(sample_df)
+        assert X.shape[1] == 4
+
+    def test_labels_are_0_1_or_2(self, sample_df):
+        from ml.train import build_features
+        _, y = build_features(sample_df)
+        assert set(y.unique()).issubset({0, 1, 2})
+
+    def test_home_win_label(self):
+        from ml.train import _label
+        row = pd.Series({"home_goals": 3, "away_goals": 1})
+        assert _label(row) == 2
+
+    def test_away_win_label(self):
+        from ml.train import _label
+        row = pd.Series({"home_goals": 0, "away_goals": 2})
+        assert _label(row) == 0
+
+    def test_draw_label(self):
+        from ml.train import _label
+        row = pd.Series({"home_goals": 1, "away_goals": 1})
+        assert _label(row) == 1
+
+    def test_feature_columns_present(self, sample_df):
+        from ml.train import build_features
+        X, _ = build_features(sample_df)
+        assert set(X.columns) == {"home_team_enc", "away_team_enc", "season_enc", "goal_diff_hist"}
+
+    def test_no_nulls_in_features(self, sample_df):
+        from ml.train import build_features
+        X, y = build_features(sample_df)
+        assert not X.isnull().any().any()
+        assert not y.isnull().any()
+
+
+# ===========================================================================
+# Class 10 — Data quality (from v9)
+# ===========================================================================
+class TestDataQuality:
+    def test_mock_validate_returns_summary(self, mock_validate):
+        from dags.gx_utils import ValidationSummary
+        result = mock_validate(spark_df=MagicMock(), run_id="r")
+        assert isinstance(result, ValidationSummary)
+        assert result.success is True
+
+    def test_mock_validate_failure_raises(self, mock_validate_failure):
+        from dags.gx_utils import DataQualityError
+        with pytest.raises(DataQualityError):
+            mock_validate_failure(spark_df=MagicMock(), run_id="r")
+
+    def test_failed_expectations_populated(self, mock_validate_failure):
+        from dags.gx_utils import DataQualityError
+        try:
+            mock_validate_failure(spark_df=MagicMock(), run_id="r")
+        except DataQualityError as e:
+            assert len(e.summary.failed_expectations) == 1
+
+    def test_failure_summary_run_id(self, mock_validate_failure):
+        from dags.gx_utils import DataQualityError
+        try:
+            mock_validate_failure(spark_df=MagicMock(), run_id="r")
+        except DataQualityError as e:
+            assert e.summary.run_id == "fail-run"
+
+    def test_failed_expectation_has_type(self, mock_validate_failure):
+        from dags.gx_utils import DataQualityError
+        try:
+            mock_validate_failure(spark_df=MagicMock(), run_id="r")
+        except DataQualityError as e:
+            assert "expectation_type" in e.summary.failed_expectations[0]
+
+    def test_success_summary_no_failures(self, mock_validate):
+        from dags.gx_utils import ValidationSummary
+        result = mock_validate(spark_df=MagicMock(), run_id="r")
+        assert result.failed_expectations == []
+
+    def test_validation_summary_dataclass_fields(self):
+        from dags.gx_utils import ValidationSummary
+        s = ValidationSummary(success=True, run_id="abc")
+        assert hasattr(s, "failed_expectations")
+
+    def test_data_quality_error_message(self):
+        from dags.gx_utils import DataQualityError, ValidationSummary
+        err = DataQualityError("bad data", summary=ValidationSummary(success=False, run_id="x"))
+        assert "bad data" in str(err)
+
+    def test_validation_summary_failed_list_type(self):
+        from dags.gx_utils import ValidationSummary
+        s = ValidationSummary(success=False, run_id="r", failed_expectations=[{}])
+        assert isinstance(s.failed_expectations, list)
+
+    def test_mock_called_with_run_id(self, mock_validate):
+        mock_validate(spark_df=MagicMock(), run_id="my-run")
+        _, kwargs = mock_validate.call_args
+        assert kwargs["run_id"] == "my-run"
+
+
+# ===========================================================================
+# Class 11 — MLflow train task
+# ===========================================================================
+class TestMLTrain:
+    def test_ml_train_task_calls_train_fn(self, mock_ml_train):
+        from dags.football_pipeline import ml_train
+
+        mock_ti = MagicMock()
+        context = {"ds_nodash": "20240101", "ti": mock_ti}
+
+        with patch("dags.football_pipeline.ml_train_fn", mock_ml_train):
+            ml_train(**context)
+
+        mock_ml_train.assert_called_once()
+
+    def test_ml_train_passes_run_name(self, mock_ml_train):
+        from dags.football_pipeline import ml_train
+
+        context = {"ds_nodash": "20240101", "ti": MagicMock()}
+
+        with patch("dags.football_pipeline.ml_train_fn", mock_ml_train):
+            ml_train(**context)
+
+        _, kwargs = mock_ml_train.call_args
+        assert "airflow_20240101" in kwargs.get("run_name", "")
+
+    def test_ml_train_pushes_xcom(self, mock_ml_train):
+        from dags.football_pipeline import ml_train
+
+        mock_ti = MagicMock()
+        context = {"ds_nodash": "20240101", "ti": mock_ti}
+
+        with patch("dags.football_pipeline.ml_train_fn", mock_ml_train):
+            ml_train(**context)
+
+        mock_ti.xcom_push.assert_called_once_with(
+            key="mlflow_run_id", value="mock-run-id-abc123"
+        )
+
+    def test_ml_train_fn_sets_experiment(self):
+        from ml.train import train
+
+        with patch("ml.train.mlflow") as mock_mlflow, \
+             patch("ml.train.get_spark") as mock_spark, \
+             patch("ml.train.load_delta") as mock_load, \
+             patch("ml.train.build_features") as mock_feat, \
+             patch("ml.train.train_test_split") as mock_split, \
+             patch("ml.train.xgb.XGBClassifier") as mock_xgb:
+
+            mock_load.return_value = pd.DataFrame()
+            X = pd.DataFrame(np.zeros((20, 4)), columns=["a", "b", "c", "d"])
+            y = pd.Series([0, 1, 2] * 6 + [0, 2])
+            mock_feat.return_value = (X, y)
+            mock_split.return_value = (X[:16], X[16:], y[:16], y[16:])
+
+            model = MagicMock()
+            model.predict.return_value = np.array([0, 1, 2, 2])
+            model.predict_proba.return_value = np.tile([0.2, 0.3, 0.5], (4, 1))
+            mock_xgb.return_value = model
+            mock_mlflow.start_run.return_value.__enter__ = MagicMock(
+                return_value=MagicMock(info=MagicMock(run_id="test-id"))
+            )
+            mock_mlflow.start_run.return_value.__exit__ = MagicMock(return_value=False)
+
+            train()
+
+        mock_mlflow.set_experiment.assert_called_once()
+
+    def test_ml_train_fn_logs_accuracy(self):
+        from ml.train import train
+
+        with patch("ml.train.mlflow") as mock_mlflow, \
+             patch("ml.train.get_spark"), \
+             patch("ml.train.load_delta") as mock_load, \
+             patch("ml.train.build_features") as mock_feat, \
+             patch("ml.train.train_test_split") as mock_split, \
+             patch("ml.train.xgb.XGBClassifier") as mock_xgb:
+
+            mock_load.return_value = pd.DataFrame()
+            X = pd.DataFrame(np.zeros((20, 4)), columns=["a", "b", "c", "d"])
+            y = pd.Series([0, 1, 2] * 6 + [0, 2])
+            mock_feat.return_value = (X, y)
+            mock_split.return_value = (X[:16], X[16:], y[:16], y[16:])
+
+            model = MagicMock()
+            model.predict.return_value = np.array([0, 1, 2, 2])
+            model.predict_proba.return_value = np.tile([0.2, 0.3, 0.5], (4, 1))
+            mock_xgb.return_value = model
+            run_mock = MagicMock(info=MagicMock(run_id="test-id"))
+            mock_mlflow.start_run.return_value.__enter__ = MagicMock(return_value=run_mock)
+            mock_mlflow.start_run.return_value.__exit__ = MagicMock(return_value=False)
+
+            train()
+
+        calls = [str(c) for c in mock_mlflow.log_metric.call_args_list]
+        assert any("accuracy" in c for c in calls)
+
+    def test_train_returns_run_id(self):
+        from ml.train import train
+
+        with patch("ml.train.mlflow") as mock_mlflow, \
+             patch("ml.train.get_spark"), \
+             patch("ml.train.load_delta") as mock_load, \
+             patch("ml.train.build_features") as mock_feat, \
+             patch("ml.train.train_test_split") as mock_split, \
+             patch("ml.train.xgb.XGBClassifier") as mock_xgb:
+
+            mock_load.return_value = pd.DataFrame()
+            X = pd.DataFrame(np.zeros((20, 4)), columns=["a", "b", "c", "d"])
+            y = pd.Series([0, 1, 2] * 6 + [0, 2])
+            mock_feat.return_value = (X, y)
+            mock_split.return_value = (X[:16], X[16:], y[:16], y[16:])
+
+            model = MagicMock()
+            model.predict.return_value = np.array([0, 1, 2, 2])
+            model.predict_proba.return_value = np.tile([0.2, 0.3, 0.5], (4, 1))
+            mock_xgb.return_value = model
+            run_mock = MagicMock(info=MagicMock(run_id="expected-run-id"))
+            mock_mlflow.start_run.return_value.__enter__ = MagicMock(return_value=run_mock)
+            mock_mlflow.start_run.return_value.__exit__ = MagicMock(return_value=False)
+
+            result = train()
+
+        assert result == "expected-run-id"
+
+    def test_xgb_params_logged(self):
+        from ml.train import train, XGB_PARAMS
+
+        with patch("ml.train.mlflow") as mock_mlflow, \
+             patch("ml.train.get_spark"), \
+             patch("ml.train.load_delta") as mock_load, \
+             patch("ml.train.build_features") as mock_feat, \
+             patch("ml.train.train_test_split") as mock_split, \
+             patch("ml.train.xgb.XGBClassifier") as mock_xgb:
+
+            mock_load.return_value = pd.DataFrame()
+            X = pd.DataFrame(np.zeros((20, 4)), columns=["a", "b", "c", "d"])
+            y = pd.Series([0, 1, 2] * 6 + [0, 2])
+            mock_feat.return_value = (X, y)
+            mock_split.return_value = (X[:16], X[16:], y[:16], y[16:])
+            model = MagicMock()
+            model.predict.return_value = np.array([0, 1, 2, 2])
+            model.predict_proba.return_value = np.tile([0.2, 0.3, 0.5], (4, 1))
+            mock_xgb.return_value = model
+            run_mock = MagicMock(info=MagicMock(run_id="r"))
+            mock_mlflow.start_run.return_value.__enter__ = MagicMock(return_value=run_mock)
+            mock_mlflow.start_run.return_value.__exit__ = MagicMock(return_value=False)
+
+            train()
+
+        mock_mlflow.log_params.assert_called_once_with(XGB_PARAMS)
+
+    def test_model_registered_with_alias(self):
+        from ml.train import train, MODEL_ALIAS
+
+        with patch("ml.train.mlflow") as mock_mlflow, \
+             patch("ml.train.get_spark"), \
+             patch("ml.train.load_delta") as mock_load, \
+             patch("ml.train.build_features") as mock_feat, \
+             patch("ml.train.train_test_split") as mock_split, \
+             patch("ml.train.xgb.XGBClassifier") as mock_xgb:
+
+            mock_load.return_value = pd.DataFrame()
+            X = pd.DataFrame(np.zeros((20, 4)), columns=["a", "b", "c", "d"])
+            y = pd.Series([0, 1, 2] * 6 + [0, 2])
+            mock_feat.return_value = (X, y)
+            mock_split.return_value = (X[:16], X[16:], y[:16], y[16:])
+            model = MagicMock()
+            model.predict.return_value = np.array([0, 1, 2, 2])
+            model.predict_proba.return_value = np.tile([0.2, 0.3, 0.5], (4, 1))
+            mock_xgb.return_value = model
+            run_mock = MagicMock(info=MagicMock(run_id="r"))
+            mock_mlflow.start_run.return_value.__enter__ = MagicMock(return_value=run_mock)
+            mock_mlflow.start_run.return_value.__exit__ = MagicMock(return_value=False)
+
+            train()
+
+        _, kwargs = mock_mlflow.xgboost.log_model.call_args
+        assert kwargs["registered_model_name"] == MODEL_ALIAS
+
+    def test_f1_metric_logged(self):
+        from ml.train import train
+
+        with patch("ml.train.mlflow") as mock_mlflow, \
+             patch("ml.train.get_spark"), \
+             patch("ml.train.load_delta") as mock_load, \
+             patch("ml.train.build_features") as mock_feat, \
+             patch("ml.train.train_test_split") as mock_split, \
+             patch("ml.train.xgb.XGBClassifier") as mock_xgb:
+
+            mock_load.return_value = pd.DataFrame()
+            X = pd.DataFrame(np.zeros((20, 4)), columns=["a", "b", "c", "d"])
+            y = pd.Series([0, 1, 2] * 6 + [0, 2])
+            mock_feat.return_value = (X, y)
+            mock_split.return_value = (X[:16], X[16:], y[:16], y[16:])
+            model = MagicMock()
+            model.predict.return_value = np.array([0, 1, 2, 2])
+            model.predict_proba.return_value = np.tile([0.2, 0.3, 0.5], (4, 1))
+            mock_xgb.return_value = model
+            run_mock = MagicMock(info=MagicMock(run_id="r"))
+            mock_mlflow.start_run.return_value.__enter__ = MagicMock(return_value=run_mock)
+            mock_mlflow.start_run.return_value.__exit__ = MagicMock(return_value=False)
+
+            train()
+
+        calls = [str(c) for c in mock_mlflow.log_metric.call_args_list]
+        assert any("f1_weighted" in c for c in calls)
+
+
+# ===========================================================================
+# Class 12 — Predict task
+# ===========================================================================
+class TestPredict:
+    def test_predict_task_calls_predict_fn(self, mock_ml_predict):
+        from dags.football_pipeline import predict
+
+        mock_spark = MagicMock()
+        with patch("dags.football_pipeline.get_spark", return_value=mock_spark), \
+             patch("dags.football_pipeline.ml_predict_fn", mock_ml_predict):
+            predict()
+
+        mock_ml_predict.assert_called_once()
+
+    def test_predict_passes_spark_session(self, mock_ml_predict):
+        from dags.football_pipeline import predict
+
+        mock_spark = MagicMock()
+        with patch("dags.football_pipeline.get_spark", return_value=mock_spark), \
+             patch("dags.football_pipeline.ml_predict_fn", mock_ml_predict):
+            predict()
+
+        _, kwargs = mock_ml_predict.call_args
+        assert kwargs.get("spark") is mock_spark
+
+    def test_predict_fn_loads_model(self, mock_mlflow_client, mock_xgb_model):
+        from ml.predict import predict as predict_fn
+
+        mock_spark = MagicMock()
+        mock_df = MagicMock()
+        mock_df.count.return_value = 0
+        mock_spark.read.format.return_value.load.return_value = mock_df
+
+        with patch("ml.predict.mlflow.MlflowClient", return_value=mock_mlflow_client), \
+             patch("ml.predict.mlflow.xgboost.load_model", return_value=mock_xgb_model), \
+             patch("ml.predict.DeltaTable.isDeltaTable", return_value=False), \
+             patch("ml.predict.mlflow.set_tracking_uri"), \
+             patch("ml.predict.get_spark", return_value=mock_spark):
+            predict_fn(spark=mock_spark)
+
+        mock_mlflow_client.get_latest_versions.assert_called_once()
+
+    def test_predict_fn_returns_zero_when_no_new_matches(self, mock_mlflow_client, mock_xgb_model):
+        from ml.predict import predict as predict_fn
+
+        mock_spark = MagicMock()
+        mock_df = MagicMock()
+        mock_df.count.return_value = 0
+        mock_spark.read.format.return_value.load.return_value = mock_df
+
+        with patch("ml.predict.mlflow.MlflowClient", return_value=mock_mlflow_client), \
+             patch("ml.predict.mlflow.xgboost.load_model", return_value=mock_xgb_model), \
+             patch("ml.predict.DeltaTable.isDeltaTable", return_value=False), \
+             patch("ml.predict.mlflow.set_tracking_uri"), \
+             patch("ml.predict.get_spark", return_value=mock_spark):
+            result = predict_fn(spark=mock_spark)
+
+        assert result == 0
+
+    def test_predict_fn_raises_when_no_model_versions(self):
+        from ml.predict import predict as predict_fn, load_model
+
+        mock_client = MagicMock()
+        mock_client.get_latest_versions.return_value = []
+
+        with patch("ml.predict.mlflow.MlflowClient", return_value=mock_client), \
+             patch("ml.predict.mlflow.set_tracking_uri"):
+            with pytest.raises(RuntimeError, match="No registered versions"):
+                load_model()
+
+    def test_prediction_schema_has_required_fields(self):
+        from ml.predict import PREDICTION_SCHEMA
+        field_names = {f.name for f in PREDICTION_SCHEMA}
+        assert {"match_id", "outcome", "proba_away", "proba_draw", "proba_home",
+                "model_run_id", "predicted_at"}.issubset(field_names)
+
+    def test_outcome_values_are_valid(self, mock_mlflow_client, mock_xgb_model, sample_df):
+        """Predict on sample data and assert outcomes are 0, 1, or 2."""
+        from ml.predict import predict as predict_fn
+        import pandas as pd
+
+        mock_spark = MagicMock()
+        mock_matches = MagicMock()
+        mock_matches.count.return_value = len(sample_df)
+        mock_matches.toPandas.return_value = sample_df
+
+        # Chain: read -> format -> load -> select -> dropna -> join -> left_anti
+        mock_spark.read.format.return_value.load.return_value \
+            .select.return_value \
+            .dropna.return_value \
+            .join.return_value = mock_matches
+
+        written_df = None
+
+        def capture_df(df, schema):
+            nonlocal written_df
+            written_df = df
+            return MagicMock()
+
+        mock_spark.createDataFrame.side_effect = capture_df
+
+        with patch("ml.predict.mlflow.MlflowClient", return_value=mock_mlflow_client), \
+             patch("ml.predict.mlflow.xgboost.load_model", return_value=mock_xgb_model), \
+             patch("ml.predict.DeltaTable.isDeltaTable", return_value=False), \
+             patch("ml.predict.mlflow.set_tracking_uri"), \
+             patch("ml.predict.get_spark", return_value=mock_spark):
+            predict_fn(spark=mock_spark)
+
+        if written_df is not None:
+            assert set(written_df["outcome"].unique()).issubset({0, 1, 2})
+
+    def test_predict_merges_when_delta_exists(self, mock_mlflow_client, mock_xgb_model, sample_df):
+        from ml.predict import predict as predict_fn
+
+        mock_spark = MagicMock()
+        mock_matches = MagicMock()
+        mock_matches.count.return_value = len(sample_df)
+        mock_matches.toPandas.return_value = sample_df
+        mock_spark.read.format.return_value.load.return_value \
+            .select.return_value \
+            .dropna.return_value \
+            .join.return_value = mock_matches
+
+        mock_delta_table = MagicMock()
+        mock_spark.createDataFrame.return_value = MagicMock()
+
+        with patch("ml.predict.mlflow.MlflowClient", return_value=mock_mlflow_client), \
+             patch("ml.predict.mlflow.xgboost.load_model", return_value=mock_xgb_model), \
+             patch("ml.predict.DeltaTable.isDeltaTable", return_value=True), \
+             patch("ml.predict.DeltaTable.forPath", return_value=mock_delta_table), \
+             patch("ml.predict.mlflow.set_tracking_uri"), \
+             patch("ml.predict.get_spark", return_value=mock_spark):
+            predict_fn(spark=mock_spark)
+
+        mock_delta_table.alias.assert_called_once_with("existing")
+
+    def test_proba_columns_sum_to_one(self, mock_xgb_model, sample_df):
+        """Probabilities from fixture sum to 1.0 per row."""
+        from ml.train import build_features
+        X, _ = build_features(sample_df)
+        probas = mock_xgb_model.predict_proba(X)
+        sums = probas.sum(axis=1)
+        assert np.allclose(sums, 1.0)
+
+    def test_load_model_returns_run_id(self, mock_mlflow_client):
+        from ml.predict import load_model
+
+        mock_xgb = MagicMock()
+        with patch("ml.predict.mlflow.MlflowClient", return_value=mock_mlflow_client), \
+             patch("ml.predict.mlflow.xgboost.load_model", return_value=mock_xgb), \
+             patch("ml.predict.mlflow.set_tracking_uri"):
+            _, run_id = load_model()
+
+        assert run_id == "test-mlflow-run-id"

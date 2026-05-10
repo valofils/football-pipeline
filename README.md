@@ -1,122 +1,112 @@
-# football-pipeline-v9 — Great Expectations data quality
+# football-pipeline-v10 — MLOps (MLflow + XGBoost)
 
-Builds directly on v8 (Delta Lake on S3). Replaces the hand-rolled null
-checks in `validate` with a full Great Expectations expectations suite,
-a checkpoint that persists results to S3, and auto-generated Data Docs.
+Adds a match-outcome predictor trained on the Delta table and tracked
+via MLflow. Builds directly on v9 (Great Expectations) with no schema
+changes to existing tables.
 
 ---
 
-## What changed from v8
+## What changed from v9
 
-| Component | v8 | v9 |
+| Component | v9 | v10 |
 |---|---|---|
-| `validate` task | `df.filter(col.isNull()).count()` | `validate_dataframe()` → GE checkpoint |
-| Expectation store | — | S3: `s3://<bucket>/great_expectations/expectations/` |
-| Validation results | — | S3: `s3://<bucket>/great_expectations/validations/` |
-| Data Docs | — | S3: `s3://<bucket>/great_expectations/data_docs/index.html` |
-| Failure mode | Airflow task raises on null | `DataQualityError` with structured summary |
-| New files | — | `gx/`, `dags/gx_utils.py` |
-
-No new Docker services. No new infrastructure — GE stores use the S3
-bucket already provisioned by Terraform in v7.
+| `ml_train` task | — | trains XGBoost, logs metrics + model to MLflow |
+| `predict` task | — | scores new matches, merges to `delta/predictions` |
+| MLflow tracking server | — | new Docker service on port 5000 |
+| DAG chain | `… >> dbt_run` | `… >> [dbt_run, ml_train] >> predict` |
+| New packages | — | `mlflow==2.13.0`, `xgboost==2.0.3`, `scikit-learn==1.5.0` |
+| Tests | 50 (10 classes) | **60 (12 classes)** |
+| New files | — | `ml/train.py`, `ml/predict.py`, `mlflow/mlflow.env`, `scripts/init_mlflow_db.sql` |
 
 ---
 
-## New files
+## Architecture
 
 ```
-gx/
-  great_expectations.yml          # data context — S3 stores + spark datasource
-  expectations/
-    matches_suite.json            # 15 expectations (nulls, ranges, uniqueness, regex)
-  checkpoints/
-    matches_checkpoint.yml        # runs suite, stores results, updates Data Docs
-dags/
-  gx_utils.py                     # build_context, validate_dataframe, DataQualityError
-tests/
-  conftest.py                     # ge_context, ge_suite, ge_validator, mock_validate fixtures
-  test_dag.py                     # 50 tests, 10 classes (TestDataQuality is new)
+kafka_ingest
+     │
+  validate  (Great Expectations checkpoint → S3 Data Docs)
+     │
+load_postgres
+     ├── dbt_run          (existing analytical models)
+     └── ml_train         ← NEW: XGBoost, logs to MLflow
+              │
+           predict        ← NEW: scores matches → delta/predictions
 ```
 
 ---
 
-## Expectations in `matches_suite.json`
+## New concepts
 
-| # | Expectation | Columns / scope |
-|---|---|---|
-| 1 | `expect_table_columns_to_match_ordered_list` | all 7 columns in order |
-| 2–6 | `expect_column_values_to_not_be_null` | match_id, season, home_team, away_team, home_goals, away_goals |
-| 7 | `expect_column_values_to_be_unique` | match_id |
-| 8–9 | `expect_column_values_to_be_of_type` | home_goals → int, away_goals → int |
-| 10–11 | `expect_column_values_to_be_between` | home_goals [0,20], away_goals [0,20] |
-| 12 | `expect_column_values_to_match_regex` | season → `^\d{4}-\d{2}$` |
-| 13 | `expect_table_row_count_to_be_between` | [1, 500] |
-| 14 | `expect_column_pair_values_to_not_be_equal` | home_team ≠ away_team |
-| 15 | `expect_column_values_to_not_be_null` | away_goals |
+### Outcome labels
+| Value | Meaning |
+|---|---|
+| 0 | Away win |
+| 1 | Draw |
+| 2 | Home win |
 
----
+### Features used
+`home_team_enc`, `away_team_enc`, `season_enc`, `goal_diff_hist`
+(all derived from existing Delta columns — no new data sources).
 
-## DAG flow
+### MLflow Model Registry
+`ml_train` registers the model under the alias
+`football_outcome_predictor`. `predict` fetches the latest version via
+`MlflowClient.get_latest_versions()` and calls `predict_proba` to emit
+per-class probabilities alongside the hard label.
 
-```
-kafka_ingest  →  validate  →  load_postgres  →  dbt_run
-                    │
-                    ▼  (on failure)
-              DataQualityError
-              (task marked FAILED, downstream skipped)
-                    │
-                    ▼  (always, via GE action list)
-              S3: validations JSON + Data Docs HTML
-```
+### Prediction Delta table
+Written to `s3a://football-data-lake/delta/predictions`. New rows are
+merged (`whenNotMatchedInsertAll`) so re-runs are idempotent.
 
 ---
 
-## Key mental models
-
-### Expectation suite
-JSON document declaring what "good data" looks like. Decoupled from code
-— edit the JSON, no Python changes needed.
-
-### Checkpoint
-Wires a batch (a live DataFrame) to a suite, then fires a list of
-**actions** after validation:
-- `StoreValidationResultAction` → writes the JSON result to S3
-- `UpdateDataDocsAction` → rebuilds the HTML Data Docs site on S3
-
-### Data Docs
-Auto-generated static HTML site. Browse to:
-```
-s3://<bucket>/great_expectations/data_docs/index.html
-```
-Shows pass/fail per run, per expectation, with trend charts. Serve
-locally with `aws s3 cp --recursive` or mount the S3 prefix behind
-CloudFront.
-
-### DataQualityError
-Raised by `validate_dataframe()` when `checkpoint_result.success` is
-False. Airflow marks the task as FAILED; `load_postgres` and `dbt_run`
-are skipped. The structured `summary` dict on the exception carries
-the list of violated expectations — visible in Airflow task logs.
-
-### Execution engine
-GE 0.18 uses a **SparkDFExecutionEngine**, so validation runs inside
-the same Spark session that reads the Delta table. No data leaves Spark.
-
----
-
-## Running tests
+## Running locally
 
 ```bash
-pytest tests/ -v --cov=dags --cov-report=term-missing
-```
+# Start all services (includes MLflow on :5000)
+docker compose up -d
 
-Expected: **50 passed**.
+# Trigger DAG manually
+airflow dags trigger football_pipeline
+
+# Open MLflow UI
+open http://localhost:5000
+
+# Run tests
+pytest tests/ -v --cov=dags --cov=ml --cov-report=term-missing
+# Expected: 60 passed
+```
 
 ---
 
-## Viewing Data Docs locally
+## MLflow UI quick tour
 
-```bash
-aws s3 cp s3://<bucket>/great_expectations/data_docs/ ./data_docs --recursive
-open data_docs/index.html
-```
+| Screen | What to look for |
+|---|---|
+| Experiments → `football_outcome_predictor` | Every DAG run creates one MLflow run |
+| Run detail → Metrics | `accuracy`, `f1_weighted` |
+| Run detail → Params | XGB hyperparameters + `train_rows`, `delta_path` |
+| Models → `football_outcome_predictor` | Registered versions; latest auto-loaded by `predict` |
+| Run detail → Artifacts → `model/` | `model.xgb`, `conda.yaml`, `MLmodel` |
+
+---
+
+## Full stack (end of v10)
+
+| Layer | Technology |
+|---|---|
+| Language | Python 3.12 |
+| Messaging | Apache Kafka 3.7 · confluent-kafka 2.4.0 |
+| DataFrames | PySpark 3.5.1 |
+| Storage format | Delta Lake 3.2.0 |
+| Serialisation | JSON · PyArrow 15 · Parquet/Snappy |
+| Database | PostgreSQL 16 · psycopg2 · JDBC · AWS RDS |
+| Object storage | AWS S3 · s3a:// |
+| Modelling | dbt-core 1.8.3 · dbt-postgres |
+| **ML** | **XGBoost 2.0.3 · scikit-learn 1.5.0** |
+| **Experiment tracking** | **MLflow 2.13.0 (PostgreSQL backend · S3 artefacts)** |
+| Data quality | Great Expectations 0.18.19 |
+| Testing | pytest · pytest-cov · moto |
+| Orchestration | Apache Airflow 2.9.1 · LocalExecutor |
+| Infrastructure | Docker Compose · Terraform 1.7+ |

@@ -1,114 +1,176 @@
 """
-football_pipeline.py — v9: Great Expectations data quality layer.
+dags/football_pipeline.py
+--------------------------
+v10 — MLOps layer added on top of v9 (Great Expectations).
 
-DAG chain (unchanged structure):
-    kafka_ingest >> validate >> load_postgres >> dbt_run
-
-Change from v8:
-    validate task:  hand-rolled null checks → GE checkpoint via gx_utils.validate_dataframe()
-    On any expectation failure the task raises DataQualityError,
-    marking the DAG run as failed and preventing downstream tasks from executing.
-    Checkpoint results + Data Docs are written to S3 by the GE action list.
+DAG chain:
+  kafka_ingest >> validate >> load_postgres >> dbt_run
+                                            >> ml_train >> predict
 """
 
 from __future__ import annotations
 
 import os
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
 
-from airflow.decorators import dag, task
-from airflow.operators.bash import BashOperator
+from airflow import DAG
+from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-from dags.gx_utils import validate_dataframe
-from dags.spark_utils import (
-    delta_path,
-    get_spark,
-    jdbc_params_from_env,
-    merge_delta,
-    write_delta,
+from delta import configure_spark_with_delta_pip
+from pyspark.sql import SparkSession
+from pyspark.sql import functions as F
+
+from dags.gx_utils import validate_dataframe, DataQualityError  # noqa: F401
+from ml.train import train as ml_train_fn
+from ml.predict import predict as ml_predict_fn
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "football_matches")
+DELTA_MATCHES_PATH = os.getenv(
+    "DELTA_MATCHES_PATH", "s3a://football-data-lake/delta/matches"
 )
-from kafka.consumer.consume_matches import consume_matches
+DELTA_PREDICTIONS_PATH = os.getenv(
+    "DELTA_PREDICTIONS_PATH", "s3a://football-data-lake/delta/predictions"
+)
+POSTGRES_CONN_ID = "football_postgres"
+DBT_PROJECT_DIR = os.getenv("DBT_PROJECT_DIR", "/opt/airflow/dbt")
 
-MATCHES_TABLE = "matches"
-DBT_DIR = "/opt/airflow/dbt"
-
-DEFAULT_ARGS = {
-    "owner": "airflow",
-    "retries": 2,
+default_args = {
+    "owner": "data-engineering",
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+    "email_on_failure": False,
 }
 
 
-@dag(
+# ---------------------------------------------------------------------------
+# Spark factory
+# ---------------------------------------------------------------------------
+def get_spark(app_name: str = "football-pipeline") -> SparkSession:
+    builder = (
+        SparkSession.builder.appName(app_name)
+        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+        .config(
+            "spark.sql.catalog.spark_catalog",
+            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        )
+    )
+    return configure_spark_with_delta_pip(builder).getOrCreate()
+
+
+# ---------------------------------------------------------------------------
+# Task callables
+# ---------------------------------------------------------------------------
+def kafka_ingest(delta_path: str = DELTA_MATCHES_PATH, **_) -> None:
+    from confluent_kafka import Consumer
+
+    consumer = Consumer(
+        {
+            "bootstrap.servers": KAFKA_BOOTSTRAP,
+            "group.id": "airflow-ingest",
+            "auto.offset.reset": "earliest",
+        }
+    )
+    consumer.subscribe([KAFKA_TOPIC])
+    records = []
+    try:
+        while True:
+            msg = consumer.poll(timeout=5.0)
+            if msg is None:
+                break
+            if msg.error():
+                logger.error("Kafka error: %s", msg.error())
+                continue
+            import json
+            records.append(json.loads(msg.value().decode()))
+    finally:
+        consumer.close()
+
+    if not records:
+        logger.info("No messages consumed — skipping write.")
+        return
+
+    spark = get_spark("football-ingest")
+    df = spark.createDataFrame(records)
+
+    from delta.tables import DeltaTable
+
+    if DeltaTable.isDeltaTable(spark, delta_path):
+        dt = DeltaTable.forPath(spark, delta_path)
+        dt.alias("t").merge(
+            df.alias("s"), "t.match_id = s.match_id"
+        ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+    else:
+        df.write.format("delta").mode("overwrite").save(delta_path)
+
+    logger.info("Ingested %d records into %s", len(records), delta_path)
+
+
+def validate(delta_path: str = DELTA_MATCHES_PATH, **_) -> None:
+    spark = get_spark("football-validate")
+    df = spark.read.format("delta").load(delta_path)
+    validate_dataframe(spark_df=df, run_id=datetime.utcnow().isoformat())
+
+
+def load_postgres(delta_path: str = DELTA_MATCHES_PATH, **_) -> None:
+    spark = get_spark("football-load")
+    df = spark.read.format("delta").load(delta_path)
+    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
+    engine = hook.get_sqlalchemy_engine()
+    df.toPandas().to_sql("matches", engine, if_exists="replace", index=False)
+    logger.info("Loaded %d rows to postgres.matches", df.count())
+
+
+def dbt_run(**_) -> None:
+    import subprocess
+
+    result = subprocess.run(
+        ["dbt", "run", "--project-dir", DBT_PROJECT_DIR, "--profiles-dir", DBT_PROJECT_DIR],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"dbt run failed:\n{result.stderr}")
+    logger.info(result.stdout)
+
+
+def ml_train(**context) -> None:
+    run_id = ml_train_fn(run_name=f"airflow_{context['ds_nodash']}")
+    context["ti"].xcom_push(key="mlflow_run_id", value=run_id)
+    logger.info("MLflow run_id: %s", run_id)
+
+
+def predict(**_) -> None:
+    spark = get_spark("football-predict")
+    written = ml_predict_fn(spark=spark)
+    logger.info("predict task wrote %d new predictions", written)
+
+
+# ---------------------------------------------------------------------------
+# DAG definition
+# ---------------------------------------------------------------------------
+with DAG(
     dag_id="football_pipeline",
-    schedule="@weekly",
+    default_args=default_args,
+    schedule_interval="@daily",
     start_date=datetime(2024, 1, 1),
     catchup=False,
-    default_args=DEFAULT_ARGS,
-    tags=["football", "v9"],
-)
-def football_pipeline():
+    tags=["football", "mlops"],
+) as dag:
 
-    @task()
-    def kafka_ingest() -> str:
-        """Consume Kafka topic → write to Delta Lake on S3."""
-        spark = get_spark()
-        rows = consume_matches()
-        df = spark.createDataFrame(rows)
-        write_delta(df, MATCHES_TABLE, mode="append")
-        spark.stop()
-        return delta_path(MATCHES_TABLE)
+    t_ingest = PythonOperator(task_id="kafka_ingest", python_callable=kafka_ingest)
+    t_validate = PythonOperator(task_id="validate", python_callable=validate)
+    t_load = PythonOperator(task_id="load_postgres", python_callable=load_postgres)
+    t_dbt = PythonOperator(task_id="dbt_run", python_callable=dbt_run)
+    t_train = PythonOperator(task_id="ml_train", python_callable=ml_train)
+    t_predict = PythonOperator(task_id="predict", python_callable=predict)
 
-    @task()
-    def validate(delta_table_path: str, **context) -> str:
-        """
-        Read Delta table → run Great Expectations checkpoint.
-
-        Raises DataQualityError (→ task failure) if any expectation fails.
-        Checkpoint results and Data Docs are stored on S3 by the GE action list.
-        """
-        spark = get_spark()
-        df = spark.read.format("delta").load(delta_table_path)
-
-        run_id = context["run_id"]  # Airflow logical run_id
-        validate_dataframe(spark_df=df, run_id=run_id, raise_on_failure=True)
-
-        spark.stop()
-        return delta_table_path
-
-    @task()
-    def load_postgres(delta_table_path: str) -> None:
-        """Delta Lake → RDS PostgreSQL via Spark JDBC + ON CONFLICT upsert."""
-        spark = get_spark()
-        df = spark.read.format("delta").load(delta_table_path)
-
-        jdbc_url, props = jdbc_params_from_env()
-        df.write.jdbc(
-            url=jdbc_url,
-            table="matches_staging",
-            mode="overwrite",
-            properties=props,
-        )
-
-        hook = PostgresHook(postgres_conn_id="football_db")
-        hook.run("""
-            INSERT INTO matches
-                SELECT * FROM matches_staging
-            ON CONFLICT (match_id) DO UPDATE SET
-                home_goals  = EXCLUDED.home_goals,
-                away_goals  = EXCLUDED.away_goals,
-                match_date  = EXCLUDED.match_date;
-        """)
-        spark.stop()
-
-    dbt_run = BashOperator(
-        task_id="dbt_run",
-        bash_command=f"cd {DBT_DIR} && dbt run && dbt test",
-    )
-
-    path = kafka_ingest()
-    validated = validate(path)
-    load_postgres(validated) >> dbt_run
-
-
-football_pipeline()
+    t_ingest >> t_validate >> t_load >> [t_dbt, t_train]
+    t_train >> t_predict

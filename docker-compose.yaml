@@ -8,36 +8,42 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__FERNET_KEY: ""
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
     AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    # Postgres / RDS
+    # Football DB (RDS in prod, local Postgres in dev)
     FOOTBALL_DB_HOST: ${FOOTBALL_DB_HOST}
     FOOTBALL_DB_PORT: ${FOOTBALL_DB_PORT:-5432}
-    FOOTBALL_DB_NAME: football
-    FOOTBALL_DB_USER: ${FOOTBALL_DB_USER}
+    FOOTBALL_DB_NAME: ${FOOTBALL_DB_NAME:-football}
+    FOOTBALL_DB_USER: ${FOOTBALL_DB_USER:-football}
     FOOTBALL_DB_PASSWORD: ${FOOTBALL_DB_PASSWORD}
-    # AWS / S3
+    # AWS
     AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
     AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
-    S3_BUCKET_NAME: ${S3_BUCKET_NAME}
+    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-west-1}
+    # Delta / S3
+    DELTA_MATCHES_PATH: s3a://football-data-lake/delta/matches
+    DELTA_PREDICTIONS_PATH: s3a://football-data-lake/delta/predictions
+    # GX
+    GX_S3_BUCKET: football-data-lake
+    # MLflow
+    MLFLOW_TRACKING_URI: http://mlflow:5000
+    MLFLOW_EXPERIMENT: football_outcome_predictor
+    ML_MODEL_ALIAS: football_outcome_predictor
     # Kafka
     KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-    KAFKA_TOPIC: matches
-    # Spark
-    SPARK_MASTER_URL: spark://spark-master:7077
-    SPARK_JARS: /opt/spark/jars/postgresql.jar,/opt/spark/jars/hadoop-aws.jar,/opt/spark/jars/aws-java-sdk-bundle.jar,/opt/spark/jars/delta-spark_2.12-3.2.0.jar,/opt/spark/jars/delta-storage-3.2.0.jar
-    # Great Expectations — no extra services; uses S3 stores declared in great_expectations.yml
-    GX_ROOT: /opt/airflow/gx
+    KAFKA_TOPIC: football_matches
   volumes:
     - ./dags:/opt/airflow/dags
+    - ./ml:/opt/airflow/ml
     - ./gx:/opt/airflow/gx
     - ./dbt:/opt/airflow/dbt
-    - ./spark/jars:/opt/spark/jars
     - ./logs:/opt/airflow/logs
   depends_on:
     airflow-db:
       condition: service_healthy
 
 services:
+  # -----------------------------------------------------------------------
+  # Airflow metadata DB
+  # -----------------------------------------------------------------------
   airflow-db:
     image: postgres:16
     environment:
@@ -45,10 +51,16 @@ services:
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 10s
       retries: 5
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
+      - ./scripts/init_mlflow_db.sql:/docker-entrypoint-initdb.d/init_mlflow_db.sql
 
+  # -----------------------------------------------------------------------
+  # Airflow services
+  # -----------------------------------------------------------------------
   airflow-webserver:
     <<: *airflow-common
     command: webserver
@@ -59,6 +71,39 @@ services:
     <<: *airflow-common
     command: scheduler
 
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create --username admin --firstname Admin
+               --lastname User --role Admin --email admin@example.com
+               --password admin"
+
+  # -----------------------------------------------------------------------
+  # MLflow tracking server  ← NEW in v10
+  # -----------------------------------------------------------------------
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    command: >
+      mlflow server
+        --backend-store-uri postgresql+psycopg2://mlflow:mlflow@airflow-db/mlflow
+        --default-artifact-root s3://football-data-lake/mlflow/artifacts
+        --host 0.0.0.0
+        --port 5000
+    env_file: ./mlflow/mlflow.env
+    ports:
+      - "5000:5000"
+    depends_on:
+      airflow-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 15s
+      retries: 5
+
+  # -----------------------------------------------------------------------
+  # Spark cluster
+  # -----------------------------------------------------------------------
   spark-master:
     image: bitnami/spark:3.5.1
     environment:
@@ -79,6 +124,9 @@ services:
     volumes:
       - ./spark/jars:/opt/spark/jars
 
+  # -----------------------------------------------------------------------
+  # Kafka
+  # -----------------------------------------------------------------------
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
     environment:
@@ -104,9 +152,15 @@ services:
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
     depends_on: [kafka]
 
+  # -----------------------------------------------------------------------
+  # Moto S3 (local dev / CI)
+  # -----------------------------------------------------------------------
   moto-server:
     image: motoserver/moto:latest
     ports:
       - "5555:5000"
     environment:
       MOTO_S3_CUSTOM_ENDPOINTS: "http://moto-server:5000"
+
+volumes:
+  airflow-db-data:
