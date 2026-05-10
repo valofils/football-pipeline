@@ -1,0 +1,212 @@
+groups:
+  # ────────────────────────────────────────────────────────────────────────────
+  # Streaming SLOs
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: streaming_slos
+    rules:
+      - alert: KafkaConsumerLagHigh
+        expr: kafka_consumergroup_lag{consumergroup="football-streaming"} > 1000
+        for: 5m
+        labels:
+          severity: warning
+          component: streaming
+        annotations:
+          summary: "Kafka consumer lag is high"
+          description: >
+            Consumer group 'football-streaming' lag is {{ $value }} messages
+            (threshold: 1000). Streaming job may be falling behind.
+
+      - alert: KafkaConsumerLagCritical
+        expr: kafka_consumergroup_lag{consumergroup="football-streaming"} > 5000
+        for: 2m
+        labels:
+          severity: critical
+          component: streaming
+        annotations:
+          summary: "Kafka consumer lag is critically high"
+          description: >
+            Consumer group 'football-streaming' lag is {{ $value }} messages.
+            Streaming job is severely behind; Delta Lake writes may be stalled.
+
+      - alert: StreamingJobDown
+        expr: absent(kafka_consumergroup_lag{consumergroup="football-streaming"})
+        for: 3m
+        labels:
+          severity: critical
+          component: streaming
+        annotations:
+          summary: "Streaming consumer group missing"
+          description: >
+            No lag metric found for consumer group 'football-streaming' for 3m.
+            The Spark Structured Streaming job may have stopped.
+
+      - alert: SparkBatchDurationHigh
+        expr: >
+          spark_streaming_batch_duration_ms > 30000
+        for: 5m
+        labels:
+          severity: warning
+          component: spark
+        annotations:
+          summary: "Spark batch processing time exceeds SLO"
+          description: >
+            Spark streaming batch duration is {{ $value }}ms (SLO: 30s).
+            Delta Lake merge operations may be slow.
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Airflow DAG SLOs
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: airflow_slos
+    rules:
+      - alert: AirflowDAGFailure
+        expr: >
+          airflow_dag_run_duration_success{dag_id="football_pipeline"} == 0
+          or airflow_dag_run_failed{dag_id="football_pipeline"} > 0
+        for: 1m
+        labels:
+          severity: critical
+          component: airflow
+        annotations:
+          summary: "football_pipeline DAG failed"
+          description: >
+            The football_pipeline Airflow DAG has a failed run.
+            Check the Airflow UI for task-level errors.
+
+      - alert: AirflowDAGDurationHigh
+        expr: >
+          airflow_dag_run_duration{dag_id="football_pipeline"} > 3600
+        for: 0m
+        labels:
+          severity: warning
+          component: airflow
+        annotations:
+          summary: "football_pipeline DAG run exceeded 1 hour"
+          description: >
+            DAG run duration is {{ $value }}s (SLO: 3600s).
+            Investigate slow tasks: validate, dbt_run, or ml_train.
+
+      - alert: AirflowTaskQueueDepthHigh
+        expr: airflow_task_instance_created_state > 50
+        for: 10m
+        labels:
+          severity: warning
+          component: airflow
+        annotations:
+          summary: "Airflow task queue depth is high"
+          description: >
+            {{ $value }} tasks in queue for 10m. Scheduler or worker may be overloaded.
+
+      - alert: AirflowSchedulerHeartbeatMissing
+        expr: time() - airflow_scheduler_heartbeat > 60
+        for: 2m
+        labels:
+          severity: critical
+          component: airflow
+        annotations:
+          summary: "Airflow scheduler heartbeat missing"
+          description: "Scheduler last heartbeat was {{ $value }}s ago."
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # Kafka infrastructure
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: kafka_infrastructure
+    rules:
+      - alert: KafkaBrokerDown
+        expr: kafka_brokers < 1
+        for: 1m
+        labels:
+          severity: critical
+          component: kafka
+        annotations:
+          summary: "No Kafka brokers available"
+          description: "All Kafka brokers appear to be down."
+
+      - alert: KafkaUnderReplicatedPartitions
+        expr: kafka_topic_partition_under_replicated_partition > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: kafka
+        annotations:
+          summary: "Kafka has under-replicated partitions"
+          description: >
+            {{ $value }} partitions are under-replicated for 5m on topic {{ $labels.topic }}.
+
+      - alert: KafkaOffsetCommitRateDropped
+        expr: rate(kafka_consumergroup_current_offset{consumergroup="football-streaming"}[5m]) == 0
+        for: 5m
+        labels:
+          severity: warning
+          component: streaming
+        annotations:
+          summary: "Streaming job has stopped committing offsets"
+          description: >
+            No offset commits for 'football-streaming' in the last 5m.
+            The Spark job may be stalled at a Delta merge.
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # MLflow / model quality SLOs
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: mlflow_model_slos
+    rules:
+      - alert: ModelAccuracyDropped
+        expr: mlflow_latest_metric{metric="accuracy", model="match_outcome"} < 0.70
+        for: 0m
+        labels:
+          severity: warning
+          component: mlflow
+        annotations:
+          summary: "Match outcome model accuracy below SLO"
+          description: >
+            Latest model accuracy is {{ $value }} (SLO: ≥ 0.70).
+            Trigger a re-train or investigate feature drift.
+
+      - alert: ModelNotRegisteredRecently
+        expr: time() - mlflow_model_last_registered_timestamp{model="match_outcome"} > 86400
+        for: 0m
+        labels:
+          severity: warning
+          component: mlflow
+        annotations:
+          summary: "No new model version registered in 24h"
+          description: >
+            Last model registration was {{ $value }}s ago.
+            The ml_train task may have failed silently.
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # PostgreSQL
+  # ────────────────────────────────────────────────────────────────────────────
+  - name: postgres_health
+    rules:
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          component: postgres
+        annotations:
+          summary: "PostgreSQL is down"
+          description: "postgres_exporter cannot reach PostgreSQL."
+
+      - alert: PostgresConnectionsHigh
+        expr: pg_stat_activity_count > 80
+        for: 5m
+        labels:
+          severity: warning
+          component: postgres
+        annotations:
+          summary: "PostgreSQL connection count is high"
+          description: >
+            {{ $value }} active connections (threshold: 80).
+            Airflow load_postgres task may be holding connections open.
+
+      - alert: PostgresLongRunningQuery
+        expr: pg_stat_activity_max_tx_duration > 300
+        for: 2m
+        labels:
+          severity: warning
+          component: postgres
+        annotations:
+          summary: "Long-running PostgreSQL query detected"
+          description: >
+            A query has been running for {{ $value }}s (threshold: 300s).

@@ -1,169 +1,238 @@
 version: "3.9"
 
-x-airflow-common: &airflow-common
-  image: apache/airflow:2.9.1-python3.12
-  environment:
-    AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db:5432/airflow
-    AIRFLOW__CORE__FERNET_KEY: ""
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
-    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-    # Delta Lake / S3
-    DELTA_PATH: s3a://football-data/delta/matches
-    PREDICTIONS_DELTA_PATH: s3a://football-data/delta/predictions
-    AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-    AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-    AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-eu-west-1}
-    # MLflow
-    MLFLOW_TRACKING_URI: http://mlflow:5000
-    MLFLOW_EXPERIMENT: football_outcome
-    # Kafka / Streaming
-    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-    KAFKA_TOPIC: football_matches
-    KAFKA_STARTING_OFFSETS: earliest
-    STREAMING_CHECKPOINT_PATH: s3a://football-data/checkpoints/matches
-    STREAMING_TRIGGER_INTERVAL: "10 seconds"
-    # v11: packages required by spark-submit for the streaming job
-    # Override in .env for a self-hosted Spark cluster or S3-backed jars.
-    SPARK_SUBMIT_OPTIONS: >-
-      --packages
-      io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1
-    SPARK_SUBMIT_BIN: spark-submit
-    STREAM_SCRIPT_PATH: /opt/airflow/streaming/stream_ingest.py
-    # dbt
-    DBT_PROJECT_DIR: /opt/airflow/dbt
-    # GX
-    GX_ROOT: /opt/airflow/gx
-  volumes:
-    - ./dags:/opt/airflow/dags
-    - ./streaming:/opt/airflow/streaming
-    - ./ml:/opt/airflow/ml
-    - ./dbt:/opt/airflow/dbt
-    - ./gx:/opt/airflow/gx
-    - ./logs:/opt/airflow/logs
-    - ./plugins:/opt/airflow/plugins
-  depends_on:
-    airflow-db:
-      condition: service_healthy
+# ────────────────────────────────────────────────────────────────────────────
+# Shared environment references
+# ────────────────────────────────────────────────────────────────────────────
+x-airflow-env: &airflow-env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+  AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY}
+  AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+  # v11: streaming
+  SPARK_SUBMIT_OPTIONS: "--packages io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
+  STREAM_SCRIPT_PATH: /opt/airflow/streaming/stream_ingest.py
+  STREAMING_CHECKPOINT_PATH: s3a://${S3_BUCKET}/checkpoints/matches
+  # AWS
+  AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+  AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+  AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+  S3_BUCKET: ${S3_BUCKET}
+  # Postgres RDS
+  POSTGRES_HOST: ${POSTGRES_HOST}
+  POSTGRES_DB: ${POSTGRES_DB}
+  POSTGRES_USER: ${POSTGRES_USER}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  # Kafka
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  # MLflow
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  # v12: Prometheus push (optional – tasks can push run metrics)
+  PROMETHEUS_PUSHGATEWAY_URL: http://pushgateway:9091
+
+x-airflow-volumes: &airflow-volumes
+  - ./dags:/opt/airflow/dags
+  - ./plugins:/opt/airflow/plugins
+  - ./streaming:/opt/airflow/streaming   # v11
+  - ./data:/opt/airflow/data
+  - ./models:/opt/airflow/models
+  - ./expectations:/opt/airflow/expectations
+
+networks:
+  pipeline:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  kafka-data:
+  spark-data:
+  mlflow-data:
+  delta-data:
+  prometheus-data:   # v12
+  grafana-data:      # v12
 
 services:
-  # -----------------------------------------------------------------------
-  # Postgres (Airflow metadata + MLflow backend)
-  # -----------------------------------------------------------------------
-  airflow-db:
+  # ── PostgreSQL ───────────────────────────────────────────────────────────────
+  postgres:
     image: postgres:16
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
     volumes:
-      - airflow-db-data:/var/lib/postgresql/data
-      - ./scripts/init_mlflow_db.sql:/docker-entrypoint-initdb.d/init_mlflow_db.sql
+      - postgres-data:/var/lib/postgresql/data
+    networks: [pipeline]
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 10s
       retries: 5
 
-  # -----------------------------------------------------------------------
-  # Airflow
-  # -----------------------------------------------------------------------
+  # ── Airflow ──────────────────────────────────────────────────────────────────
   airflow-init:
-    <<: *airflow-common
-    command: db migrate
-    restart: "no"
+    image: apache/airflow:2.9.1-python3.12
+    depends_on: [postgres]
+    environment: *airflow-env
+    entrypoint: >
+      bash -c "airflow db migrate && airflow users create
+        --username admin --password admin --firstname Admin
+        --lastname User --role Admin --email admin@example.com"
+    networks: [pipeline]
 
   airflow-webserver:
-    <<: *airflow-common
+    image: apache/airflow:2.9.1-python3.12
+    depends_on: [airflow-init]
+    environment: *airflow-env
+    volumes: *airflow-volumes
+    ports: ["8080:8080"]
     command: webserver
-    ports:
-      - "8080:8080"
-    restart: always
+    networks: [pipeline]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      retries: 5
 
   airflow-scheduler:
-    <<: *airflow-common
+    image: apache/airflow:2.9.1-python3.12
+    depends_on: [airflow-init]
+    environment: *airflow-env
+    volumes: *airflow-volumes
     command: scheduler
-    restart: always
+    networks: [pipeline]
 
-  # -----------------------------------------------------------------------
-  # MLflow tracking server
-  # -----------------------------------------------------------------------
-  mlflow:
-    image: ghcr.io/mlflow/mlflow:v2.13.0
-    ports:
-      - "5000:5000"
-    env_file:
-      - mlflow/mlflow.env
-    command: >
-      mlflow server
-      --backend-store-uri postgresql+psycopg2://mlflow:mlflow@airflow-db:5432/mlflow
-      --default-artifact-root s3://football-data/mlflow/artifacts
-      --host 0.0.0.0
-      --port 5000
-    depends_on:
-      airflow-db:
-        condition: service_healthy
+  # ── Kafka ────────────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks: [pipeline]
 
-  # -----------------------------------------------------------------------
-  # Spark (standalone, single worker — enough for local dev)
-  # -----------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    depends_on: [zookeeper]
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    volumes: [kafka-data:/var/lib/kafka/data]
+    networks: [pipeline]
+    ports: ["9092:9092"]
+
+  # v12: Kafka exporter for Prometheus
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:latest
+    command:
+      - --kafka.server=kafka:9092
+      - --web.listen-address=:9308
+    depends_on: [kafka]
+    networks: [pipeline]
+    ports: ["9308:9308"]
+
+  # ── Spark ────────────────────────────────────────────────────────────────────
   spark-master:
     image: bitnami/spark:3.5.1
     environment:
       SPARK_MODE: master
-      SPARK_EXTRA_CLASSPATH: /opt/spark/jars/delta-spark_2.12-3.2.0.jar:/opt/spark/jars/delta-storage-3.2.0.jar
-    ports:
-      - "7077:7077"
-      - "8081:8080"
+      SPARK_METRICS_ENABLED: "true"   # exposes /metrics/prometheus on 4040
     volumes:
-      - ./spark/jars:/opt/spark/jars
-      - ./streaming:/opt/airflow/streaming   # so spark-submit can find the script
+      - spark-data:/opt/bitnami/spark/data
+      - ./streaming:/opt/airflow/streaming
+    ports:
+      - "8090:8080"   # Spark UI
+      - "4040:4040"   # Spark metrics / streaming UI
+    networks: [pipeline]
 
   spark-worker:
     image: bitnami/spark:3.5.1
     environment:
       SPARK_MODE: worker
       SPARK_MASTER_URL: spark://spark-master:7077
-      SPARK_EXTRA_CLASSPATH: /opt/spark/jars/delta-spark_2.12-3.2.0.jar:/opt/spark/jars/delta-storage-3.2.0.jar
+    depends_on: [spark-master]
+    networks: [pipeline]
+
+  # ── MLflow ───────────────────────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.13.0
+    command: >
+      mlflow server
+        --backend-store-uri sqlite:///mlflow/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+        --host 0.0.0.0
+        --port 5000
+    volumes: [mlflow-data:/mlflow]
+    ports: ["5000:5000"]
+    networks: [pipeline]
+
+  # ── Delta Lake storage (local dev; prod uses S3) ─────────────────────────────
+  delta-store:
+    image: alpine:3.19
+    volumes: [delta-data:/delta]
+    command: tail -f /dev/null
+    networks: [pipeline]
+
+  # ────────────────────────────────────────────────────────────────────────────
+  # v12 — Observability stack
+  # ────────────────────────────────────────────────────────────────────────────
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=30d
+      - --web.enable-lifecycle          # POST /-/reload to hot-reload config
     volumes:
-      - ./spark/jars:/opt/spark/jars
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus-data:/prometheus
+    ports: ["9090:9090"]
+    networks: [pipeline]
+    restart: unless-stopped
 
-  # -----------------------------------------------------------------------
-  # Kafka
-  # -----------------------------------------------------------------------
-  zookeeper:
-    image: confluentinc/cp-zookeeper:7.6.0
+  # Grafana
+  grafana:
+    image: grafana/grafana:11.0.0
     environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/football_pipeline.json
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: ["3000:3000"]
+    depends_on: [prometheus]
+    networks: [pipeline]
+    restart: unless-stopped
 
-  kafka:
-    image: confluentinc/cp-kafka:7.6.0
-    depends_on: [zookeeper]
-    ports:
-      - "9092:9092"
+  # Prometheus Pushgateway — lets short-lived Airflow tasks push metrics
+  pushgateway:
+    image: prom/pushgateway:v1.8.0
+    ports: ["9091:9091"]
+    networks: [pipeline]
+    restart: unless-stopped
+
+  # Node exporter — host-level CPU, memory, disk metrics
+  node-exporter:
+    image: prom/node-exporter:v1.8.0
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|run)($|/)
+    volumes:
+      - /:/host:ro,rslave
+    pid: host
+    ports: ["9100:9100"]
+    networks: [pipeline]
+    restart: unless-stopped
+
+  # PostgreSQL exporter
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
-      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-
-  kafka-ui:
-    image: provectuslabs/kafka-ui:latest
-    ports:
-      - "8082:8080"
-    environment:
-      KAFKA_CLUSTERS_0_NAME: local
-      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
-    depends_on: [kafka]
-
-  # -----------------------------------------------------------------------
-  # Moto S3 (local dev / CI)
-  # -----------------------------------------------------------------------
-  moto-server:
-    image: motoserver/moto:latest
-    ports:
-      - "5555:5000"
-    environment:
-      MOTO_S3_CUSTOM_ENDPOINTS: "http://moto-server:5000"
-
-volumes:
-  airflow-db-data:
+      DATA_SOURCE_NAME: "postgresql://airflow:airflow@postgres:5432/airflow?sslmode=disable"
+    depends_on: [postgres]
+    ports: ["9187:9187"]
+    networks: [pipeline]
+    restart: unless-stopped
