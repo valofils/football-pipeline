@@ -1,189 +1,210 @@
 """
-lineage/emitters.py
-Per-stage lineage emitters for football-pipeline.
+lineage/emitters.py — Stage-specific OpenLineage context managers.
 
-Each public function wraps one pipeline stage, calls emit_run_event
-(START + COMPLETE / FAIL) and documents the datasets that stage reads
-and writes.  Import these from the DAG or the stage's own module.
+Each function wraps one pipeline stage, hard-coding the correct
+input/output datasets with schema and SQL facets where applicable.
 """
 
 from __future__ import annotations
 
-import uuid
+from contextlib import contextmanager
 from typing import Optional
 
-from openlineage.client.event_v2 import RunState
-
 from lineage.ol_client import (
-    delta_dataset,
-    emit_run_event,
-    kafka_dataset,
     lineage_run,
+    kafka_dataset,
+    delta_dataset,
     postgres_dataset,
 )
 
 # ---------------------------------------------------------------------------
-# Stage 1 – Kafka → Delta (streaming ingest)
+# Shared field schemas
 # ---------------------------------------------------------------------------
 
 MATCH_FIELDS = [
-    {"name": "match_id", "type": "string"},
-    {"name": "home_team", "type": "string"},
-    {"name": "away_team", "type": "string"},
-    {"name": "home_goals", "type": "integer"},
-    {"name": "away_goals", "type": "integer"},
-    {"name": "season", "type": "string"},
-    {"name": "date", "type": "date"},
+    ("match_id", "STRING"),
+    ("home_team", "STRING"),
+    ("away_team", "STRING"),
+    ("home_score", "INTEGER"),
+    ("away_score", "INTEGER"),
+    ("match_date", "DATE"),
+    ("competition", "STRING"),
+    ("season", "STRING"),
+    ("stadium", "STRING"),
+    ("referee", "STRING"),
+]
+
+PREDICTION_FIELDS = [
+    ("match_id", "STRING"),
+    ("predicted_winner", "STRING"),
+    ("home_win_prob", "DOUBLE"),
+    ("draw_prob", "DOUBLE"),
+    ("away_win_prob", "DOUBLE"),
+    ("model_version", "STRING"),
+    ("predicted_at", "TIMESTAMP"),
+]
+
+MART_FIELDS = [
+    ("team", "STRING"),
+    ("season", "STRING"),
+    ("wins", "INTEGER"),
+    ("draws", "INTEGER"),
+    ("losses", "INTEGER"),
+    ("goals_for", "INTEGER"),
+    ("goals_against", "INTEGER"),
+    ("points", "INTEGER"),
 ]
 
 
+# ---------------------------------------------------------------------------
+# Stage emitters
+# ---------------------------------------------------------------------------
+
+@contextmanager
 def emit_streaming_ingest(run_id: Optional[str] = None):
-    """Context manager: Kafka football_matches → Delta delta/matches."""
-    return lineage_run(
-        job_name="streaming_ingest",
-        inputs=[kafka_dataset("football_matches")],
-        outputs=[delta_dataset("delta/matches", fields=MATCH_FIELDS, as_output=True)],
-        description="Spark Structured Streaming: Kafka → Delta merge on match_id",
+    """
+    Stage 1 — Kafka → Delta Lake (matches).
+
+    Consumes football_matches topic; writes delta/matches.
+    """
+    src = kafka_dataset("football_matches", MATCH_FIELDS)
+    dst = delta_dataset("matches", MATCH_FIELDS)
+    with lineage_run(
+        "streaming_ingest",
         run_id=run_id,
-    )
+        inputs=[src],
+        outputs=[dst],
+        description="Consume raw match events from Kafka and land to Delta Lake",
+    ) as rid:
+        yield rid
 
 
-# ---------------------------------------------------------------------------
-# Stage 2 – Great Expectations validation
-# ---------------------------------------------------------------------------
-
+@contextmanager
 def emit_validation(run_id: Optional[str] = None):
-    """Context manager: Delta delta/matches → (validated in-place)."""
-    return lineage_run(
-        job_name="validate",
-        inputs=[delta_dataset("delta/matches", fields=MATCH_FIELDS)],
-        outputs=[delta_dataset("delta/matches", fields=MATCH_FIELDS, as_output=True)],
-        description="Great Expectations suite: null checks, range checks, referential integrity",
+    """
+    Stage 2 — Validate Delta Lake matches (in-place read + write).
+
+    Reads delta/matches, applies Great Expectations suite, rewrites
+    valid records; quarantines bad rows to delta/matches_quarantine.
+    """
+    src = delta_dataset("matches", MATCH_FIELDS)
+    dst = delta_dataset("matches", MATCH_FIELDS)
+    quarantine = delta_dataset("matches_quarantine", MATCH_FIELDS)
+    with lineage_run(
+        "validate_matches",
         run_id=run_id,
-    )
+        inputs=[src],
+        outputs=[dst, quarantine],
+        description="Great Expectations validation; quarantine invalid rows",
+    ) as rid:
+        yield rid
 
 
-# ---------------------------------------------------------------------------
-# Stage 3 – Delta → Postgres load
-# ---------------------------------------------------------------------------
-
-POSTGRES_FIELDS = MATCH_FIELDS  # same schema
-
+@contextmanager
 def emit_load_postgres(run_id: Optional[str] = None):
-    """Context manager: Delta delta/matches → postgres matches table."""
-    return lineage_run(
-        job_name="load_postgres",
-        inputs=[delta_dataset("delta/matches", fields=MATCH_FIELDS)],
-        outputs=[postgres_dataset("public.matches", fields=POSTGRES_FIELDS, as_output=True)],
-        description="JDBC batch load from Delta Lake into Postgres matches table",
-        run_id=run_id,
+    """
+    Stage 3 — Delta Lake → PostgreSQL public.matches.
+    """
+    src = delta_dataset("matches", MATCH_FIELDS)
+    dst = postgres_dataset("public.matches", MATCH_FIELDS)
+    sql = (
+        "INSERT INTO public.matches "
+        "SELECT * FROM delta.matches "
+        "ON CONFLICT (match_id) DO UPDATE SET "
+        "home_score=EXCLUDED.home_score, away_score=EXCLUDED.away_score"
     )
+    with lineage_run(
+        "load_postgres",
+        run_id=run_id,
+        inputs=[src],
+        outputs=[dst],
+        sql=sql,
+        description="Upsert validated matches from Delta into Postgres",
+    ) as rid:
+        yield rid
 
 
-# ---------------------------------------------------------------------------
-# Stage 4 – dbt run
-# ---------------------------------------------------------------------------
-
-DBT_FIELDS = [
-    {"name": "home_team", "type": "string"},
-    {"name": "season", "type": "string"},
-    {"name": "wins", "type": "integer"},
-    {"name": "draws", "type": "integer"},
-    {"name": "losses", "type": "integer"},
-    {"name": "goals_for", "type": "integer"},
-    {"name": "goals_against", "type": "integer"},
-    {"name": "points", "type": "integer"},
-]
-
-DBT_MODELS_SQL = """
--- mart_team_season_stats
-SELECT
-    home_team,
-    season,
-    SUM(CASE WHEN home_goals > away_goals THEN 1 ELSE 0 END) AS wins,
-    SUM(CASE WHEN home_goals = away_goals THEN 1 ELSE 0 END) AS draws,
-    SUM(CASE WHEN home_goals < away_goals THEN 1 ELSE 0 END) AS losses,
-    SUM(home_goals) AS goals_for,
-    SUM(away_goals) AS goals_against,
-    SUM(CASE WHEN home_goals > away_goals THEN 3
-             WHEN home_goals = away_goals THEN 1
-             ELSE 0 END) AS points
-FROM {{ ref('stg_matches') }}
-GROUP BY 1, 2
-"""
-
-
+@contextmanager
 def emit_dbt_run(run_id: Optional[str] = None):
-    """Context manager: postgres matches → postgres mart_team_season_stats."""
-    return lineage_run(
-        job_name="dbt_run",
-        inputs=[postgres_dataset("public.matches")],
-        outputs=[
-            postgres_dataset(
-                "public.mart_team_season_stats",
-                fields=DBT_FIELDS,
-                as_output=True,
-            )
-        ],
-        sql=DBT_MODELS_SQL,
-        description="dbt transformation: stg_matches → mart_team_season_stats",
-        run_id=run_id,
+    """
+    Stage 4 — dbt transformation: public.matches → public.mart_team_season_stats.
+    """
+    src = postgres_dataset("public.matches", MATCH_FIELDS)
+    dst = postgres_dataset("public.mart_team_season_stats", MART_FIELDS)
+    sql = (
+        "SELECT team, season, "
+        "SUM(CASE WHEN winner=team THEN 1 ELSE 0 END) AS wins, "
+        "SUM(CASE WHEN winner IS NULL THEN 1 ELSE 0 END) AS draws, "
+        "SUM(CASE WHEN winner!=team AND winner IS NOT NULL THEN 1 ELSE 0 END) AS losses, "
+        "SUM(goals_for) AS goals_for, SUM(goals_against) AS goals_against, "
+        "SUM(CASE WHEN winner=team THEN 3 WHEN winner IS NULL THEN 1 ELSE 0 END) AS points "
+        "FROM public.matches GROUP BY team, season"
     )
+    with lineage_run(
+        "dbt_transform",
+        run_id=run_id,
+        inputs=[src],
+        outputs=[dst],
+        sql=sql,
+        description="dbt model: aggregate per-team season statistics",
+    ) as rid:
+        yield rid
 
 
-# ---------------------------------------------------------------------------
-# Stage 5 – ML training
-# ---------------------------------------------------------------------------
-
-MLFLOW_FIELDS = [
-    {"name": "run_id", "type": "string"},
-    {"name": "model_name", "type": "string"},
-    {"name": "accuracy", "type": "double"},
-    {"name": "registered_at", "type": "timestamp"},
-]
-
-
+@contextmanager
 def emit_ml_train(run_id: Optional[str] = None):
-    """Context manager: Delta delta/matches → MLflow model registry."""
-    return lineage_run(
-        job_name="ml_train",
-        inputs=[delta_dataset("delta/matches", fields=MATCH_FIELDS)],
-        outputs=[
-            {
-                "namespace": "mlflow://mlflow:5000",
-                "name": "football_outcome_predictor",
-                "facets": {},
-            }
-        ],
-        description="XGBoost training: feature engineering + MLflow logging + model registration",
-        run_id=run_id,
+    """
+    Stage 5 — Train ML model: public.matches → MLflow model registry.
+    """
+    src = postgres_dataset("public.matches", MATCH_FIELDS)
+    from openlineage.client.run import Dataset
+    from openlineage.client.facet import DataSourceDatasetFacet
+
+    model_ds = Dataset(
+        namespace="mlflow://mlflow:5000",
+        name="football_outcome_predictor",
+        facets={
+            "dataSource": DataSourceDatasetFacet(
+                name="mlflow://mlflow:5000/football_outcome_predictor",
+                uri="mlflow://mlflow:5000/football_outcome_predictor",
+            )
+        },
     )
+    with lineage_run(
+        "ml_train",
+        run_id=run_id,
+        inputs=[src],
+        outputs=[model_ds],
+        description="Train gradient-boosted outcome predictor; register in MLflow",
+    ) as rid:
+        yield rid
 
 
-# ---------------------------------------------------------------------------
-# Stage 6 – Predictions
-# ---------------------------------------------------------------------------
-
-PREDICTION_FIELDS = MATCH_FIELDS + [
-    {"name": "predicted_outcome", "type": "integer"},
-    {"name": "prob_away_win", "type": "double"},
-    {"name": "prob_draw", "type": "double"},
-    {"name": "prob_home_win", "type": "double"},
-    {"name": "scored_at", "type": "timestamp"},
-]
-
-
+@contextmanager
 def emit_predict(run_id: Optional[str] = None):
-    """Context manager: Delta delta/matches + MLflow model → Delta delta/predictions."""
-    return lineage_run(
-        job_name="predict",
-        inputs=[
-            delta_dataset("delta/matches", fields=MATCH_FIELDS),
-            {"namespace": "mlflow://mlflow:5000", "name": "football_outcome_predictor", "facets": {}},
-        ],
-        outputs=[
-            delta_dataset("delta/predictions", fields=PREDICTION_FIELDS, as_output=True)
-        ],
-        description="Batch inference: fetch registered model, score unscored matches, merge to delta/predictions",
-        run_id=run_id,
+    """
+    Stage 6 — Batch inference: MLflow model → Delta Lake predictions.
+    """
+    from openlineage.client.run import Dataset
+    from openlineage.client.facet import DataSourceDatasetFacet
+
+    model_ds = Dataset(
+        namespace="mlflow://mlflow:5000",
+        name="football_outcome_predictor",
+        facets={
+            "dataSource": DataSourceDatasetFacet(
+                name="mlflow://mlflow:5000/football_outcome_predictor",
+                uri="mlflow://mlflow:5000/football_outcome_predictor",
+            )
+        },
     )
+    src = postgres_dataset("public.matches", MATCH_FIELDS)
+    dst = delta_dataset("predictions", PREDICTION_FIELDS)
+    with lineage_run(
+        "batch_predict",
+        run_id=run_id,
+        inputs=[src, model_ds],
+        outputs=[dst],
+        description="Batch prediction run; write results to Delta Lake",
+    ) as rid:
+        yield rid

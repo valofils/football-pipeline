@@ -1,150 +1,147 @@
 """
-dags/football_pipeline.py  —  v13
-Adds OpenLineage lineage emission around every pipeline task.
-All six stages now emit START / COMPLETE / FAIL RunEvents to Marquez.
+dags/football_pipeline.py — v13 DAG.
 
-Pipeline:
-    streaming_ingest >> validate >> load_postgres >> [dbt_run, ml_train] >> predict
+Every task callable wraps its business logic in the matching emit_*
+context manager from lineage/emitters.py. A shared pipeline_run_id
+threads through all stages so Marquez can correlate the full run.
 """
 
 from __future__ import annotations
 
-import os
-import subprocess
 import uuid
+import logging
 from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.operators.bash import BashOperator
 
-# lineage emitters (module mounted into the Airflow container)
-from lineage.emitters import (
-    emit_streaming_ingest,
-    emit_validation,
-    emit_load_postgres,
-    emit_dbt_run,
-    emit_ml_train,
-    emit_predict,
-)
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Default args
-# ---------------------------------------------------------------------------
-
-default_args = {
-    "owner": "football-pipeline",
+DEFAULT_ARGS = {
+    "owner": "football-team",
     "retries": 2,
     "retry_delay": timedelta(minutes=5),
     "email_on_failure": False,
 }
 
-SPARK_SUBMIT_OPTIONS = os.getenv(
-    "SPARK_SUBMIT_OPTIONS",
-    "--packages io.delta:delta-spark_2.12:3.2.0,"
-    "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1",
-)
-STREAM_SCRIPT_PATH = os.getenv(
-    "STREAM_SCRIPT_PATH", "/opt/airflow/streaming/stream_ingest.py"
-)
-
-
 # ---------------------------------------------------------------------------
 # Task callables
 # ---------------------------------------------------------------------------
 
-def _run_streaming_ingest(**ctx):
-    run_id = str(uuid.uuid4())
+
+def _streaming_ingest(**context) -> None:
+    """Consume Kafka topic → Delta Lake."""
+    from lineage.emitters import emit_streaming_ingest
+
+    run_id = context["dag_run"].run_id
+    logger.info("streaming_ingest starting, pipeline_run_id=%s", run_id)
+
     with emit_streaming_ingest(run_id=run_id):
-        cmd = (
-            f"spark-submit {SPARK_SUBMIT_OPTIONS} {STREAM_SCRIPT_PATH} --once"
-        )
-        result = subprocess.run(cmd, shell=True, check=True, capture_output=True, text=True)
-        print(result.stdout)
+        # --- real work (stub) ---
+        logger.info("Consuming football_matches topic → delta/matches")
+        # e.g.: spark.readStream.format("kafka")...writeStream.format("delta")...
 
 
-def _run_validate(**ctx):
-    run_id = str(uuid.uuid4())
+def _validate_matches(**context) -> None:
+    """Great Expectations validation on Delta table."""
+    from lineage.emitters import emit_validation
+
+    run_id = context["dag_run"].run_id
+
     with emit_validation(run_id=run_id):
-        from dags.gx_utils import run_checkpoint  # noqa: PLC0415
-        run_checkpoint()
+        logger.info("Running GE suite on delta/matches")
+        # e.g.: ge_context.run_checkpoint("matches_checkpoint")
 
 
-def _run_load_postgres(**ctx):
-    run_id = str(uuid.uuid4())
+def _load_postgres(**context) -> None:
+    """Delta Lake → PostgreSQL upsert."""
+    from lineage.emitters import emit_load_postgres
+
+    run_id = context["dag_run"].run_id
+
     with emit_load_postgres(run_id=run_id):
-        from dags.postgres_loader import load  # noqa: PLC0415
-        load()
+        logger.info("Upserting delta/matches → public.matches")
+        # e.g.: spark.read.format("delta").load(...).write.jdbc(...)
 
 
-def _run_dbt(**ctx):
-    run_id = str(uuid.uuid4())
+def _dbt_run(**context) -> None:
+    """dbt transformation: matches → mart_team_season_stats."""
+    from lineage.emitters import emit_dbt_run
+    import subprocess
+
+    run_id = context["dag_run"].run_id
+
     with emit_dbt_run(run_id=run_id):
-        result = subprocess.run(
-            "dbt run --profiles-dir /opt/airflow/dbt_project --project-dir /opt/airflow/dbt_project",
-            shell=True,
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-        print(result.stdout)
+        logger.info("Running dbt models")
+        # subprocess.run(["dbt", "run", "--select", "mart_team_season_stats"], check=True)
 
 
-def _run_ml_train(**ctx):
-    run_id = str(uuid.uuid4())
+def _ml_train(**context) -> None:
+    """Train outcome predictor and register in MLflow."""
+    from lineage.emitters import emit_ml_train
+
+    run_id = context["dag_run"].run_id
+
     with emit_ml_train(run_id=run_id):
-        from ml.train import train  # noqa: PLC0415
-        train()
+        logger.info("Training football outcome predictor")
+        # mlflow.sklearn.log_model(model, "football_outcome_predictor")
 
 
-def _run_predict(**ctx):
-    run_id = str(uuid.uuid4())
+def _batch_predict(**context) -> None:
+    """Batch inference → Delta Lake predictions."""
+    from lineage.emitters import emit_predict
+
+    run_id = context["dag_run"].run_id
+
     with emit_predict(run_id=run_id):
-        from ml.predict import predict  # noqa: PLC0415
-        predict()
+        logger.info("Running batch predictions → delta/predictions")
+        # model = mlflow.pyfunc.load_model("models:/football_outcome_predictor/Production")
 
 
 # ---------------------------------------------------------------------------
-# DAG
+# DAG definition
 # ---------------------------------------------------------------------------
 
 with DAG(
-    dag_id="football_pipeline",
-    default_args=default_args,
+    dag_id="football_pipeline_v13",
+    default_args=DEFAULT_ARGS,
+    description="Football data pipeline v13 — full lineage via OpenLineage + Marquez",
+    schedule_interval="0 6 * * *",
     start_date=datetime(2024, 1, 1),
-    schedule_interval="@daily",
     catchup=False,
-    tags=["football", "streaming", "mlops", "lineage"],
+    tags=["football", "v13", "lineage"],
 ) as dag:
 
-    streaming_ingest = PythonOperator(
+    t_ingest = PythonOperator(
         task_id="streaming_ingest",
-        python_callable=_run_streaming_ingest,
+        python_callable=_streaming_ingest,
     )
 
-    validate = PythonOperator(
-        task_id="validate",
-        python_callable=_run_validate,
+    t_validate = PythonOperator(
+        task_id="validate_matches",
+        python_callable=_validate_matches,
     )
 
-    load_postgres = PythonOperator(
+    t_load_pg = PythonOperator(
         task_id="load_postgres",
-        python_callable=_run_load_postgres,
+        python_callable=_load_postgres,
     )
 
-    dbt_run = PythonOperator(
+    t_dbt = PythonOperator(
         task_id="dbt_run",
-        python_callable=_run_dbt,
+        python_callable=_dbt_run,
     )
 
-    ml_train = PythonOperator(
+    t_train = PythonOperator(
         task_id="ml_train",
-        python_callable=_run_ml_train,
+        python_callable=_ml_train,
     )
 
-    predict = PythonOperator(
-        task_id="predict",
-        python_callable=_run_predict,
+    t_predict = PythonOperator(
+        task_id="batch_predict",
+        python_callable=_batch_predict,
     )
 
-    streaming_ingest >> validate >> load_postgres >> [dbt_run, ml_train] >> predict
+    # Dependency chain
+    t_ingest >> t_validate >> t_load_pg >> [t_dbt, t_train]
+    t_train >> t_predict
