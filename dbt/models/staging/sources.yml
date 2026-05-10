@@ -1,0 +1,39 @@
+version: 2
+
+sources:
+  - name: raw
+    description: "Raw Premier League match data loaded by the Airflow / Spark pipeline."
+    schema: public
+    tables:
+      - name: matches
+        description: "One row per Premier League match, upserted by the load_postgres task."
+        columns:
+          - name: match_id
+            description: "Unique match identifier."
+            tests:
+              - not_null
+              - unique
+          - name: season
+            description: "Season string, e.g. '2023-24'."
+            tests:
+              - not_null
+          - name: matchday
+            description: "Matchday number within the season (1–38)."
+            tests:
+              - not_null
+          - name: home_team
+            description: "Home team name."
+            tests:
+              - not_null
+          - name: away_team
+            description: "Away team name."
+            tests:
+              - not_null
+          - name: home_goals
+            description: "Goals scored by the home team."
+            tests:
+              - not_null
+          - name: away_goals
+            description: "Goals scored by the away team."
+            tests:
+              - not_null

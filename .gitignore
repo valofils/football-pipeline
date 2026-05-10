@@ -1,14 +1,23 @@
-.env
-.venv/
+# Python
 __pycache__/
 *.pyc
-*.pyo
-logs/
-data/parquet/
-spark/jars/*.jar
-airflow.cfg
-airflow.db
+.venv/
 *.egg-info/
-.coverage
-htmlcov/
-.pytest_cache/
+
+# Airflow
+logs/
+airflow.db
+
+# Data (generated)
+data/parquet/
+
+# dbt artifacts
+dbt/target/
+dbt/dbt_packages/
+dbt/.user.yml
+
+# Spark JARs (download manually per README)
+spark/jars/*.jar
+
+# Env
+.env

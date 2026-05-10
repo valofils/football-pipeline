@@ -1,0 +1,49 @@
+version: 2
+
+models:
+  - name: standings
+    description: >
+      One row per (season, team). Aggregated Premier League standings built
+      from stg_matches. Materialised as an incremental table — only new seasons
+      are processed on each dbt run.
+    columns:
+      - name: season
+        description: "Season string, e.g. '2023-24'."
+        tests:
+          - not_null
+      - name: team
+        description: "Club name."
+        tests:
+          - not_null
+      - name: played
+        description: "Total matches played."
+        tests:
+          - not_null
+      - name: won
+        tests:
+          - not_null
+      - name: drawn
+        tests:
+          - not_null
+      - name: lost
+        tests:
+          - not_null
+      - name: gf
+        description: "Goals for."
+        tests:
+          - not_null
+      - name: ga
+        description: "Goals against."
+        tests:
+          - not_null
+      - name: gd
+        description: "Goal difference (gf - ga)."
+        tests:
+          - not_null
+      - name: points
+        tests:
+          - not_null
+      - name: position
+        description: "League position within the season (1 = first)."
+        tests:
+          - not_null

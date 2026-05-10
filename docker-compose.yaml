@@ -8,52 +8,51 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
-    # Spark connection — used by SparkSubmitOperator (optional) and task env vars
     SPARK_MASTER_URL: spark://spark-master:7077
     FOOTBALL_DB_HOST: football-db
-    FOOTBALL_DB_PORT: 5432
+    FOOTBALL_DB_PORT: "5432"
     FOOTBALL_DB_NAME: football
     FOOTBALL_DB_USER: football
     FOOTBALL_DB_PASS: football
-    # JDBC jar path mounted into container
     SPARK_JARS: /opt/spark-jars/postgresql-42.7.3.jar
     _PIP_ADDITIONAL_REQUIREMENTS: >-
       pyspark==3.5.1
       psycopg2-binary==2.9.9
       pyarrow==15.0.2
       pandas==2.2.2
+      dbt-core==1.8.3
+      dbt-postgres==1.8.3
   volumes:
     - ./dags:/opt/airflow/dags
     - ./plugins:/opt/airflow/plugins
     - ./tests:/opt/airflow/tests
     - ./data:/opt/airflow/data
     - ./spark/jars:/opt/spark-jars
+    - ./dbt:/opt/airflow/dbt        # NEW: dbt project mounted into Airflow containers
     - airflow-logs:/opt/airflow/logs
-  depends_on:
+  depends_on: &airflow-depends
     airflow-db:
       condition: service_healthy
-  networks:
-    - football-net
+    football-db:
+      condition: service_healthy
 
 services:
 
-  # ── Airflow metadata database ────────────────────────────────────────────────
+  # ── Airflow metadata DB ───────────────────────────────────────────────────
   airflow-db:
     image: postgres:16
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
-    volumes:
-      - airflow-db-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
-      interval: 10s
+      interval: 5s
       retries: 5
-    networks:
-      - football-net
+    volumes:
+      - airflow-db-data:/var/lib/postgresql/data
 
-  # ── Football data database ───────────────────────────────────────────────────
+  # ── Football data DB ──────────────────────────────────────────────────────
   football-db:
     image: postgres:16
     environment:
@@ -62,32 +61,23 @@ services:
       POSTGRES_DB: football
     ports:
       - "5433:5432"
-    volumes:
-      - football-db-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "football"]
-      interval: 10s
+      interval: 5s
       retries: 5
-    networks:
-      - football-net
+    volumes:
+      - football-db-data:/var/lib/postgresql/data
 
-  # ── Spark standalone cluster ─────────────────────────────────────────────────
+  # ── Spark standalone cluster ──────────────────────────────────────────────
   spark-master:
     image: bitnami/spark:3.5.1
     environment:
       SPARK_MODE: master
-      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
-      SPARK_RPC_ENCRYPTION_ENABLED: "no"
-      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
-      SPARK_SSL_ENABLED: "no"
     ports:
-      - "8081:8080"   # Spark master UI
-      - "7077:7077"   # Spark master port
+      - "8081:8080"
+      - "7077:7077"
     volumes:
-      - ./data:/opt/airflow/data
-      - ./spark/jars:/opt/spark-jars
-    networks:
-      - football-net
+      - ./spark/jars:/opt/bitnami/spark/jars/extra
 
   spark-worker:
     image: bitnami/spark:3.5.1
@@ -95,61 +85,49 @@ services:
       SPARK_MODE: worker
       SPARK_MASTER_URL: spark://spark-master:7077
       SPARK_WORKER_MEMORY: 1G
-      SPARK_WORKER_CORES: 2
-      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
-      SPARK_RPC_ENCRYPTION_ENABLED: "no"
-      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
-      SPARK_SSL_ENABLED: "no"
-    volumes:
-      - ./data:/opt/airflow/data
-      - ./spark/jars:/opt/spark-jars
+      SPARK_WORKER_CORES: 1
     depends_on:
       - spark-master
-    networks:
-      - football-net
+    volumes:
+      - ./spark/jars:/opt/bitnami/spark/jars/extra
 
-  # ── Airflow init (runs once) ─────────────────────────────────────────────────
+  # ── Airflow init ──────────────────────────────────────────────────────────
   airflow-init:
     <<: *airflow-common
-    command: >
-      bash -c "
-        airflow db migrate &&
-        airflow users create
-          --username admin
-          --password admin
-          --firstname Admin
-          --lastname User
-          --role Admin
-          --email admin@example.com &&
-        airflow connections add football_db
-          --conn-type postgres
-          --conn-host football-db
-          --conn-login football
-          --conn-password football
-          --conn-schema football
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin --password admin \
+          --firstname Admin --lastname User \
+          --role Admin --email admin@example.com
+        airflow connections add football_db \
+          --conn-type postgres \
+          --conn-host football-db \
+          --conn-login football \
+          --conn-password football \
+          --conn-schema football \
           --conn-port 5432
-      "
-    restart: on-failure
+    depends_on:
+      <<: *airflow-depends
 
-  # ── Airflow scheduler ────────────────────────────────────────────────────────
+  # ── Airflow scheduler ─────────────────────────────────────────────────────
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
-    restart: always
+    restart: on-failure
 
-  # ── Airflow webserver ────────────────────────────────────────────────────────
+  # ── Airflow webserver ─────────────────────────────────────────────────────
   airflow-webserver:
     <<: *airflow-common
     command: webserver
     ports:
       - "8080:8080"
-    restart: always
+    restart: on-failure
 
 volumes:
+  airflow-logs:
   airflow-db-data:
   football-db-data:
-  airflow-logs:
-
-networks:
-  football-net:
-    driver: bridge

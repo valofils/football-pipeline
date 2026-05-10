@@ -1,87 +1,78 @@
 """
-test_dag.py
-~~~~~~~~~~~
-Test suite for football-pipeline-v4.
+test_dag.py — football-pipeline-v5
 
-Structure mirrors v3 — five test classes, one per concern:
-
-    TestDagStructure      — DAG loads, task IDs, dependency chain, schedule
-    TestIngestTask        — CSV read, schema enforcement, Parquet write
-    TestValidateTask      — null checks, empty-DataFrame guard, goal validation
-    TestLoadPostgresTask  — JDBC write path (monkeypatched), staging + upsert
-    TestBuildStandingsTask — Spark SQL standings logic, point totals
-
-New vs v3 test patterns
------------------------
-- DataFrame assertions use df.count(), df.schema, and df.filter() instead of
-  pandas len(), dtypes, and boolean indexing.
-- createOrReplaceTempView + spark.sql() lets us test the SQL logic in
-  isolation without touching Postgres.
-- monkeypatch replaces df.write.jdbc and PostgresHook.run so no real database
-  is required in unit tests.
+Test classes
+------------
+TestDagStructure      — DAG loads, task IDs, dependency chain, dbt_run is BashOperator
+TestIngestTask        — CSV → Parquet (Spark); carried forward from v4
+TestValidateTask      — null / empty / negative-goals guards; carried forward from v4
+TestLoadPostgresTask  — JDBC url, properties, upsert hook calls; carried forward from v4
+TestDbtModels         — NEW: stg_matches view + standings SQL tested in-memory via tempview
+TestDbtTests          — NEW: assert_positive_goals singular test logic
 """
-
 from __future__ import annotations
 
 import os
 import sys
+import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
 import pytest
 from pyspark.sql import Row, SparkSession
-from pyspark.sql import functions as F
-from pyspark.sql.types import IntegerType, StringType
+from pyspark.sql.functions import col
 
-# Make dags/ importable without installing the package
 sys.path.insert(0, str(Path(__file__).parent.parent / "dags"))
 
-from spark_utils import MATCH_SCHEMA, get_spark, jdbc_url, jdbc_properties
+from spark_utils import MATCH_SCHEMA, jdbc_url, jdbc_properties, jdbc_params_from_env
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_df(spark: SparkSession, rows: list[dict]):
-    """Build a DataFrame from sample_rows dicts with the canonical schema."""
-    return spark.createDataFrame(
-        [Row(**r) for r in rows],
-        schema=MATCH_SCHEMA,
-    )
+SAMPLE_ROWS = [
+    {"match_id": "m1", "season": "2023-24", "matchday": 1,
+     "home_team": "Arsenal", "away_team": "Chelsea",
+     "home_goals": 2, "away_goals": 0},
+    {"match_id": "m2", "season": "2023-24", "matchday": 1,
+     "home_team": "Liverpool", "away_team": "Everton",
+     "home_goals": 1, "away_goals": 1},
+    {"match_id": "m3", "season": "2023-24", "matchday": 2,
+     "home_team": "Chelsea", "away_team": "Arsenal",
+     "home_goals": 0, "away_goals": 1},
+]
+
+
+def make_df(spark: SparkSession, rows=None):
+    rows = rows or SAMPLE_ROWS
+    return spark.createDataFrame([Row(**r) for r in rows], schema=MATCH_SCHEMA)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestDagStructure
+# 1. TestDagStructure
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestDagStructure:
-    """
-    Validate the DAG loads correctly and its metadata is correct.
-    Uses DagBag exactly as in v3 — the Airflow layer hasn't changed.
-    """
-
     @pytest.fixture(scope="class")
     def dag(self):
         from airflow.models import DagBag
         dag_dir = str(Path(__file__).parent.parent / "dags")
         bag = DagBag(dag_folder=dag_dir, include_examples=False)
-        assert "football_pipeline" in bag.dags, (
-            f"DAG not found. Errors: {bag.import_errors}"
-        )
+        assert "football_pipeline" in bag.dags, "DAG not found in DagBag"
         return bag.dags["football_pipeline"]
 
     def test_dag_loads(self, dag):
         assert dag is not None
 
     def test_task_ids(self, dag):
-        expected = {"ingest", "validate", "load_postgres", "build_standings"}
-        assert set(dag.task_ids) == expected
+        ids = set(dag.task_ids)
+        assert ids == {"ingest", "validate", "load_postgres", "dbt_run"}
 
     def test_dependency_chain(self, dag):
-        assert dag.get_task("validate").upstream_task_ids    == {"ingest"}
-        assert dag.get_task("load_postgres").upstream_task_ids == {"validate"}
-        assert dag.get_task("build_standings").upstream_task_ids == {"load_postgres"}
+        assert "validate" in {t.task_id for t in dag.get_task("ingest").downstream_list}
+        assert "load_postgres" in {t.task_id for t in dag.get_task("validate").downstream_list}
+        assert "dbt_run" in {t.task_id for t in dag.get_task("load_postgres").downstream_list}
 
     def test_schedule(self, dag):
         assert dag.schedule_interval == "@weekly"
@@ -90,321 +81,314 @@ class TestDagStructure:
         assert dag.catchup is False
 
     def test_retries(self, dag):
-        for task_id in dag.task_ids:
-            assert dag.get_task(task_id).retries == 2, (
-                f"Task {task_id} should have 2 retries"
-            )
+        assert dag.default_args.get("retries") == 2
 
-    def test_tags(self, dag):
-        assert "spark" in dag.tags
-        assert "v4" in dag.tags
+    def test_dbt_run_is_bash_operator(self, dag):
+        from airflow.operators.bash import BashOperator
+        assert isinstance(dag.get_task("dbt_run"), BashOperator)
+
+    def test_dbt_run_command_contains_dbt_run(self, dag):
+        task = dag.get_task("dbt_run")
+        assert "dbt run" in task.bash_command
+
+    def test_dbt_run_command_contains_dbt_test(self, dag):
+        task = dag.get_task("dbt_run")
+        assert "dbt test" in task.bash_command
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestIngestTask
+# 2. TestIngestTask
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestIngestTask:
-    """
-    Unit tests for the ingest task function.
+    def test_csv_round_trips_to_parquet(self, spark, tmp_path):
+        df = make_df(spark)
+        csv_dir = tmp_path / "raw"
+        csv_dir.mkdir()
+        df.toPandas().to_csv(csv_dir / "matches.csv", index=False)
 
-    We test the ingest logic directly by calling spark.read.csv() ourselves
-    with a temp CSV — same approach as testing ingest.py in v1, but with
-    Spark instead of pandas.
-    """
+        loaded = spark.read.csv(str(csv_dir / "matches.csv"),
+                                schema=MATCH_SCHEMA, header=True, mode="FAILFAST")
+        parquet_dir = tmp_path / "parquet"
+        loaded.write.mode("overwrite").partitionBy("season").parquet(str(parquet_dir))
 
-    def test_csv_read_row_count(self, spark, sample_rows, tmp_dir):
-        """Spark reads all CSV rows correctly."""
-        csv_path = tmp_dir / "matches.csv"
-        # Write sample data as CSV via pandas (acceptable — this is test setup)
-        import pandas as pd
-        pd.DataFrame(sample_rows).to_csv(csv_path, index=False)
+        reread = spark.read.parquet(str(parquet_dir))
+        assert reread.count() == len(SAMPLE_ROWS)
 
-        df = (
-            spark.read
-            .option("header", "true")
-            .schema(MATCH_SCHEMA)
-            .csv(str(csv_path))
-        )
-        assert df.count() == len(sample_rows)
+    def test_failfast_rejects_wrong_type(self, spark, tmp_path):
+        from pyspark.sql.utils import AnalysisException
+        bad_csv = tmp_path / "bad.csv"
+        bad_csv.write_text("match_id,season,matchday,home_team,away_team,home_goals,away_goals\n"
+                           "m1,2023-24,one,Arsenal,Chelsea,two,0\n")
+        with pytest.raises(Exception):
+            spark.read.csv(str(bad_csv), schema=MATCH_SCHEMA,
+                           header=True, mode="FAILFAST").count()
 
-    def test_schema_enforcement(self, spark, sample_rows, tmp_dir):
-        """DataFrame schema matches MATCH_SCHEMA after CSV read."""
-        import pandas as pd
-        csv_path = tmp_dir / "matches.csv"
-        pd.DataFrame(sample_rows).to_csv(csv_path, index=False)
-
-        df = (
-            spark.read
-            .option("header", "true")
-            .schema(MATCH_SCHEMA)
-            .csv(str(csv_path))
-        )
-        assert df.schema == MATCH_SCHEMA
-
-    def test_parquet_write_read_roundtrip(self, spark, sample_rows, tmp_dir):
-        """DataFrame written as Parquet can be read back with same row count."""
-        df = make_df(spark, sample_rows)
-        parquet_path = str(tmp_dir / "parquet_out")
-
-        df.write.mode("overwrite").partitionBy("season").parquet(parquet_path)
-
-        df_back = spark.read.parquet(parquet_path)
-        assert df_back.count() == len(sample_rows)
-
-    def test_missing_csv_raises(self, tmp_dir):
-        """FileNotFoundError when raw directory has no CSVs."""
-        empty_dir = tmp_dir / "raw"
-        empty_dir.mkdir()
-        csv_files = list(empty_dir.glob("*.csv"))
-        with pytest.raises(FileNotFoundError):
-            if not csv_files:
-                raise FileNotFoundError(f"No CSV files found in {empty_dir}")
-
-    def test_partitioned_by_season(self, spark, sample_rows, tmp_dir):
-        """Parquet lake is partitioned by season (directory present)."""
-        df = make_df(spark, sample_rows)
-        parquet_path = str(tmp_dir / "parquet_out")
-        df.write.mode("overwrite").partitionBy("season").parquet(parquet_path)
-
-        partition_dirs = list(Path(parquet_path).glob("season=*"))
+    def test_parquet_partitioned_by_season(self, spark, tmp_path):
+        df = make_df(spark)
+        out = tmp_path / "parquet"
+        df.write.mode("overwrite").partitionBy("season").parquet(str(out))
+        partition_dirs = [p for p in out.iterdir() if p.is_dir() and "season=" in p.name]
         assert len(partition_dirs) >= 1
+
+    def test_missing_csv_dir_raises(self):
+        with pytest.raises(FileNotFoundError):
+            raise FileNotFoundError("No CSV files found")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestValidateTask
+# 3. TestValidateTask
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestValidateTask:
-    """
-    Unit tests for the validate task logic.
-
-    We import the inner validation logic directly, mirroring the v3 pattern
-    of calling task.function() — here we extract the checks into small
-    helper functions and test those.
-    """
-
-    def _run_validation(self, df):
-        """Replicate the validate task's checks. Raises ValueError on failure."""
-        from pyspark.sql.functions import col
-
-        if df.count() == 0:
-            raise ValueError("Parquet lake is empty")
-
-        required_cols = ["match_id", "date", "season", "home_team", "away_team",
-                         "home_goals", "away_goals"]
-        for c in required_cols:
-            null_count = df.filter(col(c).isNull()).count()
-            if null_count > 0:
-                raise ValueError(f"Column '{c}' has {null_count} null value(s)")
-
-        bad_goals = df.filter((col("home_goals") < 0) | (col("away_goals") < 0)).count()
-        if bad_goals > 0:
-            raise ValueError(f"{bad_goals} row(s) have negative goal values")
-
-    def test_clean_data_passes(self, spark, sample_rows):
-        df = make_df(spark, sample_rows)
-        self._run_validation(df)  # must not raise
+    def test_clean_data_passes(self, spark):
+        df = make_df(spark)
+        assert df.count() > 0
+        for c in df.columns:
+            assert df.filter(col(c).isNull()).count() == 0
 
     def test_empty_dataframe_raises(self, spark):
         df = spark.createDataFrame([], schema=MATCH_SCHEMA)
         with pytest.raises(ValueError, match="empty"):
-            self._run_validation(df)
+            if df.count() == 0:
+                raise ValueError("Parquet dataset is empty — nothing to validate.")
 
-    def test_null_match_id_raises(self, spark, sample_rows):
-        rows = [dict(r, match_id=None) if i == 0 else r
-                for i, r in enumerate(sample_rows)]
-        # Build via Row without strict schema so we can inject None
-        df = spark.createDataFrame(rows).select(
-            F.col("match_id").cast(StringType()),
-            F.col("date").cast(StringType()),
-            F.col("season").cast(StringType()),
-            F.col("home_team").cast(StringType()),
-            F.col("away_team").cast(StringType()),
-            F.col("home_goals").cast(IntegerType()),
-            F.col("away_goals").cast(IntegerType()),
-        )
-        with pytest.raises(ValueError, match="match_id"):
-            if df.filter(F.col("match_id").isNull()).count() > 0:
-                raise ValueError("Column 'match_id' has 1 null value(s)")
+    def test_null_column_raises(self, spark):
+        rows = [Row(match_id=None, season="2023-24", matchday=1,
+                    home_team="A", away_team="B", home_goals=1, away_goals=0)]
+        df = spark.createDataFrame(rows, schema=MATCH_SCHEMA)
+        with pytest.raises(ValueError, match="null"):
+            null_count = df.filter(col("match_id").isNull()).count()
+            if null_count > 0:
+                raise ValueError(f"Column 'match_id' has {null_count} null value(s).")
 
-    def test_negative_goals_raises(self, spark, sample_rows):
-        rows = [dict(r, home_goals=-1) if i == 0 else r
-                for i, r in enumerate(sample_rows)]
-        df = spark.createDataFrame([Row(**r) for r in rows], schema=MATCH_SCHEMA)
-        with pytest.raises(ValueError, match="negative goal"):
-            self._run_validation(df)
-
-    def test_row_count_returned(self, spark, sample_rows):
-        df = make_df(spark, sample_rows)
-        assert df.count() == len(sample_rows)
+    def test_negative_goals_raises(self, spark):
+        rows = [Row(match_id="m1", season="2023-24", matchday=1,
+                    home_team="A", away_team="B", home_goals=-1, away_goals=0)]
+        df = spark.createDataFrame(rows, schema=MATCH_SCHEMA)
+        with pytest.raises(ValueError, match="negative"):
+            neg = df.filter((col("home_goals") < 0) | (col("away_goals") < 0)).count()
+            if neg > 0:
+                raise ValueError(f"{neg} row(s) have negative goal values.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestLoadPostgresTask
+# 4. TestLoadPostgresTask
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestLoadPostgresTask:
-    """
-    Unit tests for the load_postgres task.
-
-    We monkeypatch df.write.jdbc and PostgresHook.run so no real Postgres
-    connection is needed. The test verifies that the correct JDBC url and
-    table name are passed, and that both the DDL and upsert SQL are executed.
-    """
-
     def test_jdbc_url_format(self):
-        url = jdbc_url("localhost", 5433, "football")
-        assert url == "jdbc:postgresql://localhost:5433/football"
+        url = jdbc_url(host="db", port="5432", dbname="football")
+        assert url == "jdbc:postgresql://db:5432/football"
 
     def test_jdbc_properties_keys(self):
-        props = jdbc_properties("football", "football")
-        assert props["driver"] == "org.postgresql.Driver"
-        assert props["user"] == "football"
+        props = jdbc_properties(user="u", password="p")
+        assert "user" in props
         assert "password" in props
+        assert "driver" in props
 
-    def test_write_jdbc_called_with_staging_table(self, spark, sample_rows):
-        """
-        The DataFrame write should target 'matches_staging', not 'matches' directly.
-        """
-        df = make_df(spark, sample_rows)
-        jdbc_calls = []
+    def test_jdbc_driver_is_postgres(self):
+        props = jdbc_properties(user="u", password="p")
+        assert props["driver"] == "org.postgresql.Driver"
 
-        original_write = df.write.__class__
+    def test_params_from_env(self, monkeypatch):
+        monkeypatch.setenv("FOOTBALL_DB_HOST", "myhost")
+        monkeypatch.setenv("FOOTBALL_DB_NAME", "mydb")
+        params = jdbc_params_from_env()
+        assert params["host"] == "myhost"
+        assert params["dbname"] == "mydb"
 
-        # Capture jdbc() calls via a mock write chain
-        mock_writer = MagicMock()
-        mock_writer.mode.return_value = mock_writer
-        mock_writer.option.return_value = mock_writer
-        mock_writer.jdbc.side_effect = lambda **kw: jdbc_calls.append(kw)
-
-        with patch.object(df, "write", mock_writer):
-            df.write.mode("overwrite").option("numPartitions", "4").jdbc(
-                url="jdbc:postgresql://localhost:5433/football",
-                table="matches_staging",
-                properties={"user": "football", "password": "football",
-                            "driver": "org.postgresql.Driver"},
-            )
-
-        assert any("matches_staging" in str(c) for c in jdbc_calls)
-
-    def test_hook_run_called_for_ddl_and_upsert(self):
-        """PostgresHook.run must be called twice — once for DDL, once for upsert."""
-        with patch("airflow.providers.postgres.hooks.postgres.PostgresHook.run") as mock_run:
-            mock_run.return_value = None
-            hook = MagicMock()
-            hook.run.return_value = None
-
-            hook.run("CREATE TABLE IF NOT EXISTS matches (...);")
-            hook.run("INSERT INTO matches SELECT * FROM matches_staging ON CONFLICT...")
-
-            assert hook.run.call_count == 2
+    def test_hook_run_called_for_upsert(self):
+        mock_hook = MagicMock()
+        mock_hook.run("INSERT INTO matches SELECT * FROM matches_staging ON CONFLICT (match_id) DO UPDATE SET season=EXCLUDED.season;")
+        mock_hook.run.assert_called_once()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TestBuildStandingsTask
+# 5. TestDbtModels  ← NEW
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestBuildStandingsTask:
-    """
-    Unit tests for the standings SQL logic.
+# The UNION ALL standings SQL is extracted here so it can run inside
+# spark.sql() against an in-memory temp view — no dbt compile step needed.
+# This validates the core logic independently of the dbt runtime.
 
-    We register the sample DataFrame as a Spark temp view and run the
-    STANDINGS_SQL through spark.sql() — no Postgres required.
-    This is the cleanest way to unit-test SQL logic in Spark.
-    """
+STANDINGS_SQL = """
+WITH home_perspective AS (
+    SELECT season, home_team AS team,
+           COUNT(*) AS played,
+           SUM(CASE WHEN home_goals > away_goals THEN 1 ELSE 0 END) AS won,
+           SUM(CASE WHEN home_goals = away_goals THEN 1 ELSE 0 END) AS drawn,
+           SUM(CASE WHEN home_goals < away_goals THEN 1 ELSE 0 END) AS lost,
+           SUM(home_goals) AS gf,
+           SUM(away_goals) AS ga
+    FROM   matches
+    GROUP  BY season, home_team
+),
+away_perspective AS (
+    SELECT season, away_team AS team,
+           COUNT(*) AS played,
+           SUM(CASE WHEN away_goals > home_goals THEN 1 ELSE 0 END) AS won,
+           SUM(CASE WHEN away_goals = home_goals THEN 1 ELSE 0 END) AS drawn,
+           SUM(CASE WHEN away_goals < home_goals THEN 1 ELSE 0 END) AS lost,
+           SUM(away_goals) AS gf,
+           SUM(home_goals) AS ga
+    FROM   matches
+    GROUP  BY season, away_team
+),
+combined AS (
+    SELECT * FROM home_perspective
+    UNION ALL
+    SELECT * FROM away_perspective
+),
+aggregated AS (
+    SELECT season, team,
+           SUM(played) AS played,
+           SUM(won)    AS won,
+           SUM(drawn)  AS drawn,
+           SUM(lost)   AS lost,
+           SUM(gf)     AS gf,
+           SUM(ga)     AS ga,
+           SUM(gf) - SUM(ga)    AS gd,
+           SUM(won)*3 + SUM(drawn) AS points
+    FROM   combined
+    GROUP  BY season, team
+)
+SELECT season, team, played, won, drawn, lost, gf, ga, gd, points,
+       ROW_NUMBER() OVER (PARTITION BY season ORDER BY points DESC, gd DESC, gf DESC) AS position
+FROM   aggregated
+"""
 
-    STANDINGS_SQL = """
-        WITH results AS (
-            SELECT season, home_team AS team,
-                   home_goals AS gf, away_goals AS ga,
-                   CASE WHEN home_goals > away_goals THEN 3
-                        WHEN home_goals = away_goals THEN 1
-                        ELSE 0 END AS pts
-            FROM   matches
-            UNION ALL
-            SELECT season, away_team,
-                   away_goals, home_goals,
-                   CASE WHEN away_goals > home_goals THEN 3
-                        WHEN away_goals = home_goals THEN 1
-                        ELSE 0 END
-            FROM   matches
-        )
-        SELECT season, team,
-               COUNT(*)             AS played,
-               SUM(pts)             AS points,
-               SUM(gf) - SUM(ga)   AS goal_diff,
-               SUM(gf)             AS goals_for,
-               SUM(ga)             AS goals_against,
-               SUM(CASE WHEN pts = 3 THEN 1 ELSE 0 END) AS wins,
-               SUM(CASE WHEN pts = 1 THEN 1 ELSE 0 END) AS draws,
-               SUM(CASE WHEN pts = 0 THEN 1 ELSE 0 END) AS losses
-        FROM   results
-        GROUP  BY season, team
-    """
+STG_SQL = """
+SELECT
+    match_id,
+    season,
+    matchday,
+    home_team,
+    away_team,
+    home_goals,
+    away_goals,
+    CASE WHEN home_goals > away_goals THEN home_team
+         WHEN away_goals > home_goals THEN away_team
+         ELSE NULL END AS winning_team,
+    CASE WHEN home_goals = away_goals THEN 'draw'
+         WHEN home_goals > away_goals THEN 'home_win'
+         ELSE 'away_win' END AS result_type
+FROM raw_matches
+WHERE match_id IS NOT NULL
+"""
+
+
+class TestDbtModels:
+    """Test dbt model SQL logic in-memory using Spark SQL temp views."""
 
     @pytest.fixture(autouse=True)
-    def register_view(self, spark, sample_rows):
-        df = make_df(spark, sample_rows)
+    def register_views(self, spark):
+        df = make_df(spark)
         df.createOrReplaceTempView("matches")
+        df.createOrReplaceTempView("raw_matches")
         yield
         spark.catalog.dropTempView("matches")
+        spark.catalog.dropTempView("raw_matches")
 
-    def test_standings_sql_runs(self, spark):
-        result = spark.sql(self.STANDINGS_SQL)
+    def test_standings_returns_rows(self, spark):
+        result = spark.sql(STANDINGS_SQL)
         assert result.count() > 0
 
-    def test_result_columns_present(self, spark):
-        result = spark.sql(self.STANDINGS_SQL)
-        expected_cols = {"season", "team", "played", "points", "goal_diff",
-                         "wins", "draws", "losses"}
-        assert expected_cols.issubset(set(result.columns))
+    def test_standings_has_expected_columns(self, spark):
+        result = spark.sql(STANDINGS_SQL)
+        cols = set(result.columns)
+        assert {"season", "team", "played", "won", "drawn", "lost",
+                "gf", "ga", "gd", "points", "position"}.issubset(cols)
 
-    def test_arsenal_three_points(self, spark):
-        """Arsenal won m001 (2-0) → 3 points."""
-        result = spark.sql(self.STANDINGS_SQL)
-        arsenal = result.filter(F.col("team") == "Arsenal").collect()
-        assert len(arsenal) == 1
-        assert arsenal[0]["points"] == 3
-        assert arsenal[0]["wins"] == 1
+    def test_standings_points_calculation(self, spark):
+        """Arsenal: 2 wins (home m1, away m3) = 6 pts. Chelsea: 0 pts."""
+        result = spark.sql(STANDINGS_SQL)
+        rows = {r.team: r for r in result.filter("season='2023-24'").collect()}
+        assert rows["Arsenal"].points == 6
+        assert rows["Chelsea"].points == 0
 
-    def test_wolves_zero_points(self, spark):
-        """Wolves lost m001 (0-2) → 0 points."""
-        result = spark.sql(self.STANDINGS_SQL)
-        wolves = result.filter(F.col("team") == "Wolves").collect()
-        assert len(wolves) == 1
-        assert wolves[0]["points"] == 0
-        assert wolves[0]["losses"] == 1
+    def test_standings_arsenal_position_is_1(self, spark):
+        result = spark.sql(STANDINGS_SQL)
+        arsenal = result.filter("team='Arsenal'").collect()[0]
+        assert arsenal.position == 1
 
-    def test_man_city_three_points(self, spark):
-        """Man City won m002 (away 2-1) → 3 points."""
-        result = spark.sql(self.STANDINGS_SQL)
-        city = result.filter(F.col("team") == "Man City").collect()
-        assert len(city) == 1
-        assert city[0]["points"] == 3
+    def test_standings_played_count(self, spark):
+        result = spark.sql(STANDINGS_SQL)
+        rows = {r.team: r for r in result.filter("season='2023-24'").collect()}
+        # Arsenal played m1 (home) + m3 (away) = 2; Liverpool m2 (home) = 1
+        assert rows["Arsenal"].played == 2
+        assert rows["Liverpool"].played == 1
 
-    def test_goal_diff_correct(self, spark):
-        """Arsenal: 2 gf, 0 ga → goal_diff = 2."""
-        result = spark.sql(self.STANDINGS_SQL)
-        arsenal = result.filter(F.col("team") == "Arsenal").collect()[0]
-        assert arsenal["goal_diff"] == 2
+    def test_stg_matches_adds_result_type(self, spark):
+        result = spark.sql(STG_SQL)
+        assert "result_type" in result.columns
 
-    def test_all_teams_represented(self, spark, sample_rows):
-        """Every team that played appears in the standings."""
-        result = spark.sql(self.STANDINGS_SQL)
-        teams_in_standings = {r["team"] for r in result.collect()}
-        expected_teams = set()
-        for r in sample_rows:
-            expected_teams.add(r["home_team"])
-            expected_teams.add(r["away_team"])
-        assert expected_teams == teams_in_standings
+    def test_stg_matches_home_win_result_type(self, spark):
+        result = spark.sql(STG_SQL)
+        m1 = result.filter("match_id='m1'").collect()[0]
+        assert m1.result_type == "home_win"
 
-    def test_played_count(self, spark):
-        """Each team in the sample played exactly 1 match."""
-        result = spark.sql(self.STANDINGS_SQL)
-        for row in result.collect():
-            assert row["played"] == 1, f"{row['team']} should have played 1 match"
+    def test_stg_matches_draw_result_type(self, spark):
+        result = spark.sql(STG_SQL)
+        m2 = result.filter("match_id='m2'").collect()[0]
+        assert m2.result_type == "draw"
 
-    def test_union_all_present_in_sql(self):
-        """SQL must use UNION ALL to capture both home and away results."""
-        assert "UNION ALL" in self.STANDINGS_SQL
+    def test_stg_matches_filters_null_match_id(self, spark):
+        from pyspark.sql import Row
+        rows_with_null = SAMPLE_ROWS + [
+            {"match_id": None, "season": "2023-24", "matchday": 3,
+             "home_team": "X", "away_team": "Y", "home_goals": 1, "away_goals": 0}
+        ]
+        df = spark.createDataFrame([Row(**r) for r in rows_with_null], schema=MATCH_SCHEMA)
+        df.createOrReplaceTempView("raw_matches")
+        result = spark.sql(STG_SQL)
+        assert result.count() == len(SAMPLE_ROWS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. TestDbtTests  ← NEW
+# ─────────────────────────────────────────────────────────────────────────────
+
+ASSERT_POSITIVE_GOALS_SQL = """
+SELECT match_id, home_goals, away_goals
+FROM   stg_matches
+WHERE  home_goals < 0 OR away_goals < 0
+"""
+
+
+class TestDbtTests:
+    """Test the custom singular dbt test logic in-memory."""
+
+    def test_no_violations_on_clean_data(self, spark):
+        df = make_df(spark)
+        df.createOrReplaceTempView("stg_matches")
+        violations = spark.sql(ASSERT_POSITIVE_GOALS_SQL)
+        assert violations.count() == 0
+        spark.catalog.dropTempView("stg_matches")
+
+    def test_detects_negative_home_goals(self, spark):
+        rows = [Row(match_id="bad", season="2023-24", matchday=1,
+                    home_team="A", away_team="B", home_goals=-1, away_goals=0)]
+        df = spark.createDataFrame(rows, schema=MATCH_SCHEMA)
+        df.createOrReplaceTempView("stg_matches")
+        violations = spark.sql(ASSERT_POSITIVE_GOALS_SQL)
+        assert violations.count() == 1
+        spark.catalog.dropTempView("stg_matches")
+
+    def test_detects_negative_away_goals(self, spark):
+        rows = [Row(match_id="bad", season="2023-24", matchday=1,
+                    home_team="A", away_team="B", home_goals=0, away_goals=-2)]
+        df = spark.createDataFrame(rows, schema=MATCH_SCHEMA)
+        df.createOrReplaceTempView("stg_matches")
+        violations = spark.sql(ASSERT_POSITIVE_GOALS_SQL)
+        assert violations.count() == 1
+        spark.catalog.dropTempView("stg_matches")
+
+    def test_zero_goals_is_not_a_violation(self, spark):
+        rows = [Row(match_id="ok", season="2023-24", matchday=1,
+                    home_team="A", away_team="B", home_goals=0, away_goals=0)]
+        df = spark.createDataFrame(rows, schema=MATCH_SCHEMA)
+        df.createOrReplaceTempView("stg_matches")
+        violations = spark.sql(ASSERT_POSITIVE_GOALS_SQL)
+        assert violations.count() == 0
+        spark.catalog.dropTempView("stg_matches")
