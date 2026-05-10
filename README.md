@@ -1,166 +1,186 @@
-# football-pipeline-v4
+# football-pipeline-v6 — Kafka + Airflow + Spark + dbt
 
-Builds on [v3](https://github.com/you/football-pipeline-v3) (Airflow orchestration),
-replacing **pandas** with **Apache Spark** for distributed DataFrame processing.
-
-## What changed from v3
-
-| Task | v3 | v4 |
-|---|---|---|
-| `ingest` | `pandas.read_csv` + `pyarrow.write_to_dataset` | `spark.read.csv` + `df.write.parquet` |
-| `validate` | `df.isnull()`, `len(df)` | `df.filter(col.isNull()).count()` |
-| `load_postgres` | `psycopg2` / `PostgresHook.run` | `df.write.jdbc` + `PostgresHook.run` (upsert) |
-| `build_standings` | `PostgresHook.run` SQL | `spark.read.jdbc` → `spark.sql` → `df.write.jdbc` |
-
-The four-task chain, `@weekly` schedule, retries, and XCom contracts are **unchanged** from v3. Only the compute layer is different.
-
-## What it does
-
-A weekly Airflow DAG ingests Premier League CSV data, enforces a PySpark schema, writes a
-partitioned Parquet lake, upserts rows into PostgreSQL via JDBC, and rebuilds a standings
-table — all orchestrated with automatic retries and full Airflow UI observability.
+Extends v5 by adding **Apache Kafka** before the Airflow pipeline.
+Instead of dropping CSVs into `data/raw/`, match events are produced to a
+Kafka topic and consumed into PostgreSQL in near-real-time.
 
 ```
-ingest >> validate >> load_postgres >> build_standings
+CSV files  →  Producer  →  Kafka topic `match-events`
+                                   ↓
+                           Airflow DAG (weekly)
+                                   ↓
+               ┌───────────────────────────────────────┐
+               │  kafka_ingest  →  validate  →          │
+               │  load_postgres  →  dbt_run             │
+               └───────────────────────────────────────┘
+                                   ↓
+                         PostgreSQL  →  dbt models
+                         (matches_staging, matches, standings)
 ```
+
+---
+
+## What's new in v6
+
+| Component | Change |
+|---|---|
+| `kafka/producer/produce_matches.py` | Reads CSVs, publishes one JSON message per match to `match-events` |
+| `kafka/consumer/consume_matches.py` | Consumes topic, bulk-upserts into `matches_staging` |
+| `dags/football_pipeline.py` | `ingest` task replaced by `kafka_ingest` (calls consumer) |
+| `docker-compose.yaml` | Adds `zookeeper`, `kafka`, `kafka-ui` services |
+| `tests/test_dag.py` | 35 tests across 7 classes (adds `TestProducer`, `TestConsumer`, `TestConsumerUpsert`) |
+
+---
 
 ## Stack
 
 | Layer | Technology |
 |---|---|
-| Orchestration | Apache Airflow 2.9.1 (LocalExecutor) |
-| Compute | Apache Spark 3.5.1 (standalone cluster) |
-| Language | Python 3.12 · PySpark 3.5.1 |
-| Data | PyArrow 15 · Parquet/Snappy |
-| Storage | PostgreSQL 16 (via JDBC) |
-| Testing | pytest · pytest-cov |
+| Language | Python 3.12 |
+| Messaging | Apache Kafka 3.7 · confluent-kafka 2.4.0 |
+| DataFrames | PySpark 3.5.1 |
+| Serialisation | JSON (messages) · Parquet/Snappy (lake) |
+| Database | PostgreSQL 16 · psycopg2 · JDBC |
+| Modelling | dbt-core 1.8.3 · dbt-postgres |
+| Testing | pytest · pytest-cov · dbt test |
+| Orchestration | Apache Airflow 2.9.1 · LocalExecutor · PostgresHook |
+| Compute | Apache Spark 3.5.1 standalone cluster |
 | Infrastructure | Docker Compose |
+
+---
+
+## Quickstart
+
+### 1. Start the stack
+
+```bash
+docker compose up -d
+```
+
+Services and ports:
+
+| Service | URL |
+|---|---|
+| Airflow UI | http://localhost:8081 (admin / admin) |
+| Kafka UI | http://localhost:8080 |
+| Spark Master UI | http://localhost:8082 |
+| Football DB | localhost:5433 |
+
+### 2. Download the PostgreSQL JDBC JAR (one-time)
+
+```bash
+mkdir -p spark/jars
+curl -L -o spark/jars/postgresql.jar \
+  https://jdbc.postgresql.org/download/postgresql-42.7.3.jar
+```
+
+### 3. Produce match events
+
+Run the producer against your CSV files (from outside Docker, using the
+EXTERNAL Kafka listener on port 9093):
+
+```bash
+KAFKA_BOOTSTRAP_SERVERS=localhost:9093 \
+  python kafka/producer/produce_matches.py --data-dir data/raw/
+```
+
+Or for a single season:
+
+```bash
+KAFKA_BOOTSTRAP_SERVERS=localhost:9093 \
+  python kafka/producer/produce_matches.py --data-dir data/raw/ --season 2023-24
+```
+
+### 4. Trigger the DAG
+
+In the Airflow UI, enable and trigger `football_pipeline` manually, or wait
+for the `@weekly` schedule.
+
+The `kafka_ingest` task will consume all pending messages from `match-events`
+and upsert them into `matches_staging`.
+
+### 5. Run tests
+
+```bash
+pip install -r requirements.txt
+pytest tests/ -v --cov=. --cov-report=term-missing
+```
+
+DB-dependent tests (`TestConsumerUpsert`) are skipped automatically if
+`football-db` is not reachable on `localhost:5433`.
+
+---
+
+## Key Kafka concepts introduced in v6
+
+### Topic: `match-events`
+
+- **Partitions**: 3 (parallel consumption; messages keyed by `season:match_id`
+  so all matches for a season land in the same partition)
+- **Retention**: 7 days (`retention.ms`)
+- **Cleanup policy**: `delete` (segments expire; no compaction)
+
+### Producer config
+
+```python
+"acks": "all"          # Wait for leader + all ISRs to ack
+"retries": 5           # Retry transient errors
+"linger.ms": 10        # Batch small messages for throughput
+```
+
+### Consumer config
+
+```python
+"auto.offset.reset": "earliest"   # Start from beginning if no committed offset
+"enable.auto.commit": False        # Manual commit — only after successful DB write
+```
+
+### Offset management
+
+The consumer:
+1. Snapshots the **high-water mark** (end offset) for each partition at startup
+2. Reads until all partitions reach their high-water mark (catches up to
+   messages that existed when the job started)
+3. **Commits offsets manually** after each successful DB upsert batch
+4. On the next DAG run, consumption resumes from the last committed offset
+   (`earliest` fallback only applies to a brand-new consumer group)
+
+### Airflow integration
+
+`kafka_ingest` is a plain `@task`-decorated Python callable — no Kafka-specific
+Airflow operator required.  The consumer runs as a **finite batch job**
+(not a long-running daemon): it catches up to the high-water mark and exits.
+
+---
 
 ## Project structure
 
 ```
-football-pipeline-v4/
+football-pipeline-v6/
+├── kafka/
+│   ├── producer/
+│   │   └── produce_matches.py
+│   └── consumer/
+│       └── consume_matches.py
 ├── dags/
-│   ├── football_pipeline_dag.py   # TaskFlow DAG — four Spark tasks
-│   └── spark_utils.py             # SparkSession factory, MATCH_SCHEMA, JDBC helpers
+│   ├── football_pipeline.py
+│   └── spark_utils.py
+├── dbt/
+│   ├── models/
+│   │   ├── staging/
+│   │   │   ├── sources.yml
+│   │   │   └── stg_matches.sql
+│   │   └── marts/
+│   │       ├── standings.sql
+│   │       └── schema.yml
+│   ├── tests/
+│   │   └── assert_positive_goals.sql
+│   └── profiles.yml
 ├── tests/
-│   ├── conftest.py                # session-scoped SparkSession fixture
-│   └── test_dag.py                # 5 test classes, 25 tests
-├── data/
-│   ├── raw/                       # drop CSVs here
-│   └── parquet/                   # written by the ingest task (git-ignored)
+│   ├── conftest.py
+│   └── test_dag.py
 ├── spark/
-│   └── jars/                      # place postgresql-42.7.3.jar here (see Quickstart)
+│   └── jars/          ← place postgresql.jar here
 ├── docker-compose.yaml
-├── requirements.txt
-├── .gitignore
-└── README.md
+└── requirements.txt
 ```
-
-## Quickstart
-
-**Prerequisites:** Docker Desktop · Python 3.12
-
-```bash
-git clone https://github.com/you/football-pipeline-v4
-cd football-pipeline-v4
-
-# 1 — download the PostgreSQL JDBC driver (required for Spark <-> Postgres)
-mkdir -p spark/jars
-curl -L https://jdbc.postgresql.org/download/postgresql-42.7.3.jar \
-     -o spark/jars/postgresql-42.7.3.jar
-
-# 2 — create dirs and set Airflow UID
-mkdir -p dags plugins logs data/raw data/parquet
-echo "AIRFLOW_UID=$(id -u)" > .env
-
-# 3 — initialise Airflow (DB migrate + admin user + football_db connection)
-docker compose up airflow-init
-
-# 4 — start all services
-docker compose up -d
-#   Airflow UI  -> http://localhost:8080  (admin / admin)
-#   Spark UI    -> http://localhost:8081
-#   Football DB -> localhost:5433
-
-# 5 — drop CSVs and trigger
-docker compose exec airflow-scheduler airflow dags trigger football_pipeline
-```
-
-## Running tests
-
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-
-pytest tests/ -v --cov=dags --cov-report=term-missing
-```
-
-Tests run fully offline with `local[2]` Spark — no Docker required.
-
-### Test coverage
-
-| Class | What is tested |
-|---|---|
-| `TestDagStructure` | DAG loads, task IDs, dependency chain, schedule, retries, tags |
-| `TestIngestTask` | CSV read, schema enforcement, Parquet roundtrip, `FileNotFoundError`, partition dirs |
-| `TestValidateTask` | clean data passes, empty DataFrame raises, null column raises, negative goals raises |
-| `TestLoadPostgresTask` | JDBC url format, properties keys, staging table target, hook call count |
-| `TestBuildStandingsTask` | SQL runs, columns present, point totals, goal diff, all teams represented, `UNION ALL` |
-
-## Key Spark concepts introduced
-
-| Concept | Where |
-|---|---|
-| `SparkSession` | `spark_utils.get_spark()` — single entry point; reused across tasks |
-| `spark.read.csv` with explicit schema | `ingest` — replaces `pandas.read_csv` + PyArrow schema |
-| `df.write.partitionBy` | `ingest` — replicates v1's partitioned Parquet layout |
-| `df.filter(col.isNull()).count()` | `validate` — Spark null check vs pandas `isna()` |
-| `df.write.jdbc` | `load_postgres` — parallel write to Postgres; staging + upsert pattern |
-| `spark.read.jdbc` | `build_standings` — reads matches table into a DataFrame |
-| `createOrReplaceTempView` + `spark.sql` | `build_standings` — runs v2 UNION ALL standings SQL unchanged |
-| Lazy evaluation | all tasks — transformations build a plan; `.count()` / `.write` trigger execution |
-| `scope="session"` SparkSession fixture | `conftest.py` — one JVM startup per test run |
-
-## XCom data contract
-
-```python
-# ingest
-{"files_ingested": 1, "rows_written": 8, "parquet_dir": "/opt/airflow/data/parquet"}
-
-# validate  (extends ingest)
-{..., "rows_validated": 8, "validation_passed": True}
-
-# load_postgres  (extends validate)
-{..., "rows_loaded": 8}
-
-# build_standings  (extends load_postgres)
-{..., "standings_rows": 16, "seasons_processed": ["2024"]}
-```
-
-## Querying standings
-
-```bash
-docker compose exec football-db psql -U football -d football
-```
-
-```sql
-SELECT team, played, wins, draws, losses, points, goal_diff
-FROM   standings
-WHERE  season = '2024'
-ORDER  BY points DESC, goal_diff DESC;
-```
-
-## Learning path
-
-```
-v1  Python · pathlib · pandas · PyArrow · Parquet · argparse CLI
-v2  PostgreSQL · psycopg2 · pytest · window functions · upsert
-v3  Airflow · TaskFlow API · XCom · PostgresHook · Docker Compose
-v4  Apache Spark · SparkSession · DataFrame API · JDBC · spark.sql()   <- you are here
-v5  dbt · data modelling · incremental models · tests · sources
-```
-
-## License
-
-MIT

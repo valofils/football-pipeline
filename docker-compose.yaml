@@ -1,97 +1,163 @@
 ---
+# football-pipeline-v6 — Docker Compose
+# Adds Zookeeper + Kafka (bitnami) to the v5 stack.
+#
+# Services:
+#   zookeeper          — Kafka coordination (bitnami/zookeeper:3.9)
+#   kafka              — Kafka broker (bitnami/kafka:3.7)
+#   kafka-ui           — Optional web UI for topic inspection
+#   postgres           — Airflow metadata DB
+#   football-db        — Pipeline target DB (matches, standings)
+#   airflow-init       — One-shot: DB migrate + admin user create
+#   airflow-webserver  — Airflow UI
+#   airflow-scheduler  — DAG scheduling
+#   spark-master       — Spark standalone master
+#   spark-worker       — Spark standalone worker
+
 x-airflow-common: &airflow-common
   image: apache/airflow:2.9.1-python3.12
   environment: &airflow-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@airflow-db/airflow
-    AIRFLOW__CORE__FERNET_KEY: ''
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth
-    SPARK_MASTER_URL: spark://spark-master:7077
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__WEBSERVER__SECRET_KEY: "football-pipeline-secret"
+    # Pip packages installed at container start
+    _PIP_ADDITIONAL_REQUIREMENTS: >-
+      apache-airflow-providers-postgres==5.11.0
+      pyspark==3.5.1
+      dbt-core==1.8.3
+      dbt-postgres==1.8.3
+      confluent-kafka==2.4.0
+      psycopg2-binary==2.9.9
+    # Kafka
+    KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+    KAFKA_GROUP_ID: football-pipeline-consumer
+    KAFKA_CONSUMER_TIMEOUT: "120"
+    KAFKA_CONSUMER_BATCH_SIZE: "1000"
+    # Football DB
     FOOTBALL_DB_HOST: football-db
     FOOTBALL_DB_PORT: "5432"
     FOOTBALL_DB_NAME: football
-    FOOTBALL_DB_USER: football
-    FOOTBALL_DB_PASS: football
-    SPARK_JARS: /opt/spark-jars/postgresql-42.7.3.jar
-    _PIP_ADDITIONAL_REQUIREMENTS: >-
-      pyspark==3.5.1
-      psycopg2-binary==2.9.9
-      pyarrow==15.0.2
-      pandas==2.2.2
-      dbt-core==1.8.3
-      dbt-postgres==1.8.3
+    FOOTBALL_DB_USER: airflow
+    FOOTBALL_DB_PASSWORD: airflow
+    # Spark
+    SPARK_MASTER_URL: spark://spark-master:7077
+    SPARK_JARS: /opt/spark/jars/postgresql.jar
   volumes:
     - ./dags:/opt/airflow/dags
-    - ./plugins:/opt/airflow/plugins
-    - ./tests:/opt/airflow/tests
-    - ./data:/opt/airflow/data
-    - ./spark/jars:/opt/spark-jars
-    - ./dbt:/opt/airflow/dbt        # NEW: dbt project mounted into Airflow containers
+    - ./dbt:/opt/airflow/dbt
+    - ./kafka:/opt/airflow/kafka
+    - ./spark/jars:/opt/spark/jars
     - airflow-logs:/opt/airflow/logs
-  depends_on: &airflow-depends
-    airflow-db:
+  depends_on:
+    postgres:
       condition: service_healthy
     football-db:
+      condition: service_healthy
+    kafka:
       condition: service_healthy
 
 services:
 
-  # ── Airflow metadata DB ───────────────────────────────────────────────────
-  airflow-db:
+  # --------------------------------------------------------------------------
+  # Zookeeper (required by Kafka 3.x in KRaft-off mode)
+  # --------------------------------------------------------------------------
+  zookeeper:
+    image: bitnami/zookeeper:3.9
+    environment:
+      ALLOW_ANONYMOUS_LOGIN: "yes"
+    volumes:
+      - zookeeper-data:/bitnami/zookeeper
+    healthcheck:
+      test: ["CMD", "zkServer.sh", "status"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # --------------------------------------------------------------------------
+  # Kafka broker
+  # --------------------------------------------------------------------------
+  kafka:
+    image: bitnami/kafka:3.7
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    environment:
+      KAFKA_CFG_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,EXTERNAL://localhost:9093
+      KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_CFG_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      # Topic defaults
+      KAFKA_CFG_NUM_PARTITIONS: 3
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: 1
+      KAFKA_CFG_LOG_RETENTION_HOURS: 168   # 7 days
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    ports:
+      - "9093:9093"   # Expose EXTERNAL listener for local producer scripts
+    volumes:
+      - kafka-data:/bitnami/kafka
+    healthcheck:
+      test: ["CMD", "kafka-topics.sh", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # --------------------------------------------------------------------------
+  # Kafka UI — browse topics, messages, consumer groups
+  # http://localhost:8080
+  # --------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+
+  # --------------------------------------------------------------------------
+  # Postgres — Airflow metadata
+  # --------------------------------------------------------------------------
+  postgres:
     image: postgres:16
     environment:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD", "pg_isready", "-U", "airflow"]
       interval: 5s
       retries: 5
-    volumes:
-      - airflow-db-data:/var/lib/postgresql/data
 
-  # ── Football data DB ──────────────────────────────────────────────────────
+  # --------------------------------------------------------------------------
+  # Football DB — pipeline target (matches, standings)
+  # --------------------------------------------------------------------------
   football-db:
     image: postgres:16
     environment:
-      POSTGRES_USER: football
-      POSTGRES_PASSWORD: football
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
       POSTGRES_DB: football
     ports:
       - "5433:5432"
-    healthcheck:
-      test: ["CMD", "pg_isready", "-U", "football"]
-      interval: 5s
-      retries: 5
     volumes:
       - football-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow", "-d", "football"]
+      interval: 5s
+      retries: 5
 
-  # ── Spark standalone cluster ──────────────────────────────────────────────
-  spark-master:
-    image: bitnami/spark:3.5.1
-    environment:
-      SPARK_MODE: master
-    ports:
-      - "8081:8080"
-      - "7077:7077"
-    volumes:
-      - ./spark/jars:/opt/bitnami/spark/jars/extra
-
-  spark-worker:
-    image: bitnami/spark:3.5.1
-    environment:
-      SPARK_MODE: worker
-      SPARK_MASTER_URL: spark://spark-master:7077
-      SPARK_WORKER_MEMORY: 1G
-      SPARK_WORKER_CORES: 1
-    depends_on:
-      - spark-master
-    volumes:
-      - ./spark/jars:/opt/bitnami/spark/jars/extra
-
-  # ── Airflow init ──────────────────────────────────────────────────────────
+  # --------------------------------------------------------------------------
+  # Airflow init (one-shot)
+  # --------------------------------------------------------------------------
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
@@ -106,28 +172,65 @@ services:
         airflow connections add football_db \
           --conn-type postgres \
           --conn-host football-db \
-          --conn-login football \
-          --conn-password football \
           --conn-schema football \
-          --conn-port 5432
-    depends_on:
-      <<: *airflow-depends
+          --conn-login airflow \
+          --conn-password airflow \
+          --conn-port 5432 || true
+    restart: "no"
 
-  # ── Airflow scheduler ─────────────────────────────────────────────────────
-  airflow-scheduler:
-    <<: *airflow-common
-    command: scheduler
-    restart: on-failure
-
-  # ── Airflow webserver ─────────────────────────────────────────────────────
+  # --------------------------------------------------------------------------
+  # Airflow webserver — http://localhost:8081
+  # --------------------------------------------------------------------------
   airflow-webserver:
     <<: *airflow-common
     command: webserver
     ports:
-      - "8080:8080"
-    restart: on-failure
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Airflow scheduler
+  # --------------------------------------------------------------------------
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Spark standalone cluster (carried from v4/v5)
+  # --------------------------------------------------------------------------
+  spark-master:
+    image: bitnami/spark:3.5.1
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+      SPARK_RPC_ENCRYPTION_ENABLED: "no"
+    ports:
+      - "7077:7077"
+      - "8082:8080"   # Spark master UI
+    volumes:
+      - ./spark/jars:/opt/spark/jars
+
+  spark-worker:
+    image: bitnami/spark:3.5.1
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+      SPARK_WORKER_MEMORY: 2G
+      SPARK_WORKER_CORES: 2
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark/jars:/opt/spark/jars
 
 volumes:
-  airflow-logs:
-  airflow-db-data:
+  zookeeper-data:
+  kafka-data:
+  postgres-data:
   football-db-data:
+  airflow-logs:
