@@ -1,112 +1,102 @@
-# football-pipeline-v10 — MLOps (MLflow + XGBoost)
+# football-pipeline · v11 — Spark Structured Streaming
 
-Adds a match-outcome predictor trained on the Delta table and tracked
-via MLflow. Builds directly on v9 (Great Expectations) with no schema
-changes to existing tables.
+Replaces the finite-batch Kafka consumer with a production-grade
+**Spark Structured Streaming** job backed by Delta Lake merge semantics.
 
----
+## What changed in v11
 
-## What changed from v9
-
-| Component | v9 | v10 |
+| Area | v10 | v11 |
 |---|---|---|
-| `ml_train` task | — | trains XGBoost, logs metrics + model to MLflow |
-| `predict` task | — | scores new matches, merges to `delta/predictions` |
-| MLflow tracking server | — | new Docker service on port 5000 |
-| DAG chain | `… >> dbt_run` | `… >> [dbt_run, ml_train] >> predict` |
-| New packages | — | `mlflow==2.13.0`, `xgboost==2.0.3`, `scikit-learn==1.5.0` |
-| Tests | 50 (10 classes) | **60 (12 classes)** |
-| New files | — | `ml/train.py`, `ml/predict.py`, `mlflow/mlflow.env`, `scripts/init_mlflow_db.sql` |
+| Kafka consumer | `PythonOperator` polling batch | `BashOperator` → `spark-submit --once` |
+| Ingest file | `dags/kafka_consumer.py` | `streaming/stream_ingest.py` |
+| DAG task | `kafka_ingest` | `streaming_ingest` |
+| Delta write | `mode("append")` | `foreachBatch` + `DeltaTable.merge()` |
+| Checkpoint | none | `s3a://…/checkpoints/matches` |
+| New tests | — | Class 13 `TestStreamingIngest` (12 tests → 77 total) |
 
----
+All v10 files (MLflow, XGBoost, Great Expectations, dbt, Terraform) are
+unchanged.
 
 ## Architecture
 
 ```
-kafka_ingest
-     │
-  validate  (Great Expectations checkpoint → S3 Data Docs)
-     │
-load_postgres
-     ├── dbt_run          (existing analytical models)
-     └── ml_train         ← NEW: XGBoost, logs to MLflow
-              │
-           predict        ← NEW: scores matches → delta/predictions
+Kafka topic: football_matches
+        │
+        ▼
+spark-submit streaming/stream_ingest.py --once
+        │  readStream (kafka format)
+        │  from_json → MATCH_SCHEMA
+        │  filter(match_id.isNotNull)
+        │
+        ▼  foreachBatch(_upsert_to_delta)
+Delta Lake: s3a://football-data/delta/matches   ←── merge on match_id
+        │
+        ▼
+Airflow DAG: streaming_ingest >> validate >> load_postgres >> [dbt_run, ml_train] >> predict
 ```
 
----
+## Key design decisions
 
-## New concepts
+**`--once` trigger** — makes the streaming job finite so Airflow can track
+success/failure as a normal task. In production, remove `--once` and run
+the job as a long-lived service outside Airflow (or in a
+`KubernetesPodOperator`).
 
-### Outcome labels
-| Value | Meaning |
-|---|---|
-| 0 | Away win |
-| 1 | Draw |
-| 2 | Home win |
+**`foreachBatch` + Delta merge** — each micro-batch upserts on `match_id`,
+making the job fully idempotent. Replaying the same Kafka partition range
+is safe.
 
-### Features used
-`home_team_enc`, `away_team_enc`, `season_enc`, `goal_diff_hist`
-(all derived from existing Delta columns — no new data sources).
+**Checkpoint location** — stored in S3 (`STREAMING_CHECKPOINT_PATH`).
+Allows restarts without reprocessing already-seen offsets.
 
-### MLflow Model Registry
-`ml_train` registers the model under the alias
-`football_outcome_predictor`. `predict` fetches the latest version via
-`MlflowClient.get_latest_versions()` and calls `predict_proba` to emit
-per-class probabilities alongside the hard label.
-
-### Prediction Delta table
-Written to `s3a://football-data-lake/delta/predictions`. New rows are
-merged (`whenNotMatchedInsertAll`) so re-runs are idempotent.
-
----
+**`failOnDataLoss=false`** — prevents crashes on Kafka log compaction or
+offset gaps in dev/test environments.
 
 ## Running locally
 
 ```bash
-# Start all services (includes MLflow on :5000)
-docker compose up -d
+# 1. Start infrastructure
+docker compose up -d airflow-db kafka zookeeper mlflow moto-server
 
-# Trigger DAG manually
-airflow dags trigger football_pipeline
+# 2. Initialise Airflow DB + MLflow DB
+docker compose run --rm airflow-init
 
-# Open MLflow UI
-open http://localhost:5000
+# 3. Produce some test messages
+python scripts/produce_test_messages.py --count 50
 
-# Run tests
-pytest tests/ -v --cov=dags --cov=ml --cov-report=term-missing
-# Expected: 60 passed
+# 4. Run the streaming job manually (drains available offsets then exits)
+KAFKA_STARTING_OFFSETS=earliest \
+spark-submit \
+  --packages io.delta:delta-spark_2.12:3.2.0,org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
+  streaming/stream_ingest.py --once
+
+# 5. Trigger the full DAG
+docker compose up -d airflow-webserver airflow-scheduler
+# Open http://localhost:8080 → football_pipeline → Trigger DAG
 ```
 
----
+## Environment variables
 
-## MLflow UI quick tour
+| Variable | Default | Purpose |
+|---|---|---|
+| `KAFKA_BOOTSTRAP_SERVERS` | `kafka:9092` | Broker address |
+| `KAFKA_TOPIC` | `football_matches` | Source topic |
+| `KAFKA_STARTING_OFFSETS` | `latest` | `latest` / `earliest` |
+| `DELTA_PATH` | `s3a://…/delta/matches` | Target Delta table |
+| `STREAMING_CHECKPOINT_PATH` | `s3a://…/checkpoints/matches` | Checkpoint dir |
+| `STREAMING_TRIGGER_INTERVAL` | `10 seconds` | processingTime trigger |
+| `SPARK_SUBMIT_OPTIONS` | *(packages string)* | Extra spark-submit args |
 
-| Screen | What to look for |
-|---|---|
-| Experiments → `football_outcome_predictor` | Every DAG run creates one MLflow run |
-| Run detail → Metrics | `accuracy`, `f1_weighted` |
-| Run detail → Params | XGB hyperparameters + `train_rows`, `delta_path` |
-| Models → `football_outcome_predictor` | Registered versions; latest auto-loaded by `predict` |
-| Run detail → Artifacts → `model/` | `model.xgb`, `conda.yaml`, `MLmodel` |
+## Tests
 
----
+```bash
+pytest tests/ -v --tb=short
+# 77 tests, 13 classes
+```
 
-## Full stack (end of v10)
+## Full stack
 
-| Layer | Technology |
-|---|---|
-| Language | Python 3.12 |
-| Messaging | Apache Kafka 3.7 · confluent-kafka 2.4.0 |
-| DataFrames | PySpark 3.5.1 |
-| Storage format | Delta Lake 3.2.0 |
-| Serialisation | JSON · PyArrow 15 · Parquet/Snappy |
-| Database | PostgreSQL 16 · psycopg2 · JDBC · AWS RDS |
-| Object storage | AWS S3 · s3a:// |
-| Modelling | dbt-core 1.8.3 · dbt-postgres |
-| **ML** | **XGBoost 2.0.3 · scikit-learn 1.5.0** |
-| **Experiment tracking** | **MLflow 2.13.0 (PostgreSQL backend · S3 artefacts)** |
-| Data quality | Great Expectations 0.18.19 |
-| Testing | pytest · pytest-cov · moto |
-| Orchestration | Apache Airflow 2.9.1 · LocalExecutor |
-| Infrastructure | Docker Compose · Terraform 1.7+ |
+Python 3.12 · Kafka 3.7 · PySpark 3.5.1 · Delta Lake 3.2.0 ·
+PostgreSQL 16 · AWS S3/RDS · dbt-core 1.8.3 · Great Expectations 0.18.19 ·
+XGBoost 2.0.3 · scikit-learn 1.5.0 · MLflow 2.13.0 · Airflow 2.9.1 ·
+Docker Compose · Terraform 1.7+

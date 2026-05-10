@@ -1,32 +1,20 @@
 """
 ml/predict.py
 -------------
-Load the latest production model from the MLflow Model Registry,
-score a batch of matches from the Delta table, and write predictions
-back to a separate Delta table (delta/predictions).
-
-Prediction schema
-  match_id   STRING
-  outcome    INT       (0=away win, 1=draw, 2=home win)
-  proba_away DOUBLE
-  proba_draw DOUBLE
-  proba_home DOUBLE
-  run_id     STRING    (MLflow run that produced the model)
-  predicted_at TIMESTAMP
+v10 (unchanged in v11) — scores unscored matches and merges predictions
+into delta/predictions via whenNotMatchedInsertAll (idempotent).
 """
 
 from __future__ import annotations
 
-import os
 import logging
+import os
 from datetime import datetime, timezone
 
 import mlflow
-import mlflow.xgboost
 import pandas as pd
-from delta.tables import DeltaTable
-from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
+from mlflow import MlflowClient
+from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql.types import (
     DoubleType,
     IntegerType,
@@ -36,18 +24,19 @@ from pyspark.sql.types import (
     TimestampType,
 )
 
-from ml.train import build_features, get_spark
+from ml.train import build_features
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+DELTA_PATH = os.getenv("DELTA_PATH", "s3a://football-data/delta/matches")
+PREDICTIONS_PATH = os.getenv(
+    "PREDICTIONS_DELTA_PATH", "s3a://football-data/delta/predictions"
+)
 MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://mlflow:5000")
-MODEL_ALIAS = os.getenv("ML_MODEL_ALIAS", "football_outcome_predictor")
-DELTA_MATCHES_PATH = os.getenv(
-    "DELTA_MATCHES_PATH", "s3a://football-data-lake/delta/matches"
-)
-DELTA_PREDICTIONS_PATH = os.getenv(
-    "DELTA_PREDICTIONS_PATH", "s3a://football-data-lake/delta/predictions"
-)
+MODEL_NAME = "football_outcome_predictor"
 
 PREDICTION_SCHEMA = StructType(
     [
@@ -63,34 +52,43 @@ PREDICTION_SCHEMA = StructType(
 
 
 # ---------------------------------------------------------------------------
-# Model loading
+# Load model
 # ---------------------------------------------------------------------------
-def load_model(alias: str = MODEL_ALIAS):
-    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-    client = mlflow.MlflowClient()
-    # Fetch latest version in any stage (production-ready alias pattern)
-    versions = client.get_latest_versions(alias)
+def load_model():
+    client = MlflowClient(tracking_uri=MLFLOW_TRACKING_URI)
+    versions = client.get_latest_versions(MODEL_NAME)
     if not versions:
-        raise RuntimeError(f"No registered versions found for model '{alias}'")
+        raise RuntimeError(f"No registered versions found for model '{MODEL_NAME}'")
     latest = versions[-1]
-    model_uri = f"models:/{alias}/{latest.version}"
-    logger.info("Loading model %s version %s", alias, latest.version)
-    return mlflow.xgboost.load_model(model_uri), latest.run_id
+    model = mlflow.xgboost.load_model(f"runs:/{latest.run_id}/model")
+    return model, latest.run_id
 
 
 # ---------------------------------------------------------------------------
-# Scoring
+# Predict
 # ---------------------------------------------------------------------------
 def predict(
+    delta_path: str = DELTA_PATH,
+    predictions_path: str = PREDICTIONS_PATH,
     spark: SparkSession | None = None,
-    delta_path: str = DELTA_MATCHES_PATH,
-    predictions_path: str = DELTA_PREDICTIONS_PATH,
 ) -> int:
-    """
-    Score all matches without an existing prediction.
+    """Score unscored matches and merge into delta/predictions.
+
     Returns count of new predictions written.
     """
-    spark = spark or get_spark()
+    from delta import DeltaTable, configure_spark_with_delta_pip
+
+    if spark is None:
+        builder = (
+            SparkSession.builder.appName("football-predict")
+            .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
+            .config(
+                "spark.sql.catalog.spark_catalog",
+                "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+            )
+        )
+        spark = configure_spark_with_delta_pip(builder).getOrCreate()
+
     model, run_id = load_model()
 
     matches_df = (
@@ -100,13 +98,8 @@ def predict(
         .dropna()
     )
 
-    # Exclude already-predicted match_ids
     if DeltaTable.isDeltaTable(spark, predictions_path):
-        existing_ids = (
-            spark.read.format("delta")
-            .load(predictions_path)
-            .select("match_id")
-        )
+        existing_ids = spark.read.format("delta").load(predictions_path).select("match_id")
         matches_df = matches_df.join(existing_ids, on="match_id", how="left_anti")
 
     count = matches_df.count()
@@ -137,10 +130,12 @@ def predict(
 
     if DeltaTable.isDeltaTable(spark, predictions_path):
         dt = DeltaTable.forPath(spark, predictions_path)
-        dt.alias("existing").merge(
-            result_spark.alias("new"),
-            "existing.match_id = new.match_id",
-        ).whenNotMatchedInsertAll().execute()
+        (
+            dt.alias("existing")
+            .merge(result_spark.alias("new"), "existing.match_id = new.match_id")
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
     else:
         result_spark.write.format("delta").mode("overwrite").save(predictions_path)
 
@@ -148,9 +143,6 @@ def predict(
     return count
 
 
-# ---------------------------------------------------------------------------
-# Entrypoint
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     predict()
